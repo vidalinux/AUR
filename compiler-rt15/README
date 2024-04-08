@@ -1,0 +1,3 @@
+# if you have and cmake error please remove package llvm
+ sudo pacman -R llvm
+

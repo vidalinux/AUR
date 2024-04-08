@@ -1,0 +1,2475 @@
+From e2c511bc006473f22723ec6f6469aae3dd67cc02 Mon Sep 17 00:00:00 2001
+From: Sylvain Munaut <tnt@246tNt.com>
+Date: Wed, 9 Aug 2023 23:25:10 +0000
+Subject: [PATCH] feature(ocl): Improve Linux CL/GL sharing support
+
+This commit is aimed at drastically improving the support for the CL/GL
+sharing
+extension on linux. The current support is not really usable as it only
+supports a few texture format, and only on EGL contexts. It is also
+pretty
+buggy since it requires the texture to be bound when placing the CL call
+to
+share it which is just plain wrong and will not work in many
+applications.
+This new version makes used of the "official" interop extension from
+MESA
+which is available for GLX and EGL contexts, allows sharing of buffers
+and
+not just texture and supports many more formats.
+This is still far from being a fully compliant / full featured version
+of
+the extension, but it's a big step forward in my opinion and allows to
+run
+some real applications.
+I've tested gr-fosphor (SDR spectrum display) and Davinci Resolve as
+examples.
+Both of theses don't work without theses improvements.
+
+Fixes: https://github.com/intel/compute-runtime/issues/659
+Fixes: https://github.com/intel/compute-runtime/issues/667
+
+https://github.com/intel/compute-runtime/pull/673
+
+Related-To: NEO-3599
+
+Signed-off-by: Sylvain Munaut <tnt@246tNt.com>
+Signed-off-by: Mateusz Jablonski <mateusz.jablonski@intel.com>
+---
+ opencl/source/helpers/gl_helper.h             |   5 +-
+ .../source/sharings/gl/linux/CMakeLists.txt   |   3 +-
+ .../sharings/gl/linux/gl_buffer_linux.cpp     | 113 ++++-
+ .../gl/linux/gl_context_guard_linux.cpp       |  23 +-
+ .../sharings/gl/linux/gl_library_linux.cpp    |  13 -
+ .../sharings/gl/linux/gl_sharing_linux.cpp    |  68 +--
+ .../sharings/gl/linux/gl_sharing_linux.h      | 165 +++-----
+ .../sharings/gl/linux/gl_sync_event_linux.cpp |  24 +-
+ .../sharings/gl/linux/gl_texture_linux.cpp    | 174 +++++---
+ .../sharings/gl/linux/include/gl_types.h      |   6 +-
+ .../sharings/gl/linux/lin_enable_gl.cpp       |  21 +-
+ .../unit_test/mock_gl/linux/mock_opengl.cpp   | 221 +---------
+ .../mocks/gl/linux/mock_gl_sharing_linux.h    |  34 +-
+ .../sharings/gl/linux/CMakeLists.txt          |   4 +-
+ .../gl/linux/gl_create_from_texture_tests.cpp | 276 ------------
+ .../sharings/gl/linux/gl_library_name.cpp     |   3 +-
+ .../sharings/gl/linux/gl_texture_tests.cpp    | 370 ----------------
+ .../opengl_headers/GL/mesa_glinterop.h        | 400 ++++++++++++++++++
+ 18 files changed, 719 insertions(+), 1204 deletions(-)
+ delete mode 100644 opencl/source/sharings/gl/linux/gl_library_linux.cpp
+ delete mode 100644 opencl/test/unit_test/sharings/gl/linux/gl_create_from_texture_tests.cpp
+ delete mode 100644 opencl/test/unit_test/sharings/gl/linux/gl_texture_tests.cpp
+ create mode 100644 third_party/opengl_headers/GL/mesa_glinterop.h
+
+diff --git a/opencl/source/helpers/gl_helper.h b/opencl/source/helpers/gl_helper.h
+index acbbac5333f4..7d9fdc13377f 100644
+--- a/opencl/source/helpers/gl_helper.h
++++ b/opencl/source/helpers/gl_helper.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2018-2023 Intel Corporation
++ * Copyright (C) 2018-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -21,6 +21,9 @@ class GlFunctionHelper {
+     ConvertibleProcAddr operator[](const char *name) {
+         return ConvertibleProcAddr{reinterpret_cast<void *>(glFunctionPtr(name))};
+     }
++    bool ready() const {
++        return glFunctionPtr != nullptr;
++    }
+ 
+   protected:
+     GLFunctionType glFunctionPtr = nullptr;
+diff --git a/opencl/source/sharings/gl/linux/CMakeLists.txt b/opencl/source/sharings/gl/linux/CMakeLists.txt
+index 767d63c790fc..9ee919ab4a73 100644
+--- a/opencl/source/sharings/gl/linux/CMakeLists.txt
++++ b/opencl/source/sharings/gl/linux/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (C) 2023 Intel Corporation
++# Copyright (C) 2023-2024 Intel Corporation
+ #
+ # SPDX-License-Identifier: MIT
+ #
+@@ -14,7 +14,6 @@ if(UNIX)
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_arb_sync_event_linux.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_buffer_linux.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_context_guard_linux.cpp
+-      ${CMAKE_CURRENT_SOURCE_DIR}/gl_library_linux.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_sharing_linux.h
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_sharing_linux.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_sync_event_linux.cpp
+diff --git a/opencl/source/sharings/gl/linux/gl_buffer_linux.cpp b/opencl/source/sharings/gl/linux/gl_buffer_linux.cpp
+index 3241b71a5f2a..27e20dede088 100644
+--- a/opencl/source/sharings/gl/linux/gl_buffer_linux.cpp
++++ b/opencl/source/sharings/gl/linux/gl_buffer_linux.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -20,19 +20,71 @@
+ 
+ #include "config.h"
+ 
++#include <poll.h>
++#include <unistd.h>
++
+ using namespace NEO;
+ 
+ Buffer *GlBuffer::createSharedGlBuffer(Context *context, cl_mem_flags flags, unsigned int bufferId, cl_int *errcodeRet) {
+     ErrorCodeHelper errorCode(errcodeRet, CL_SUCCESS);
+-    CL_GL_BUFFER_INFO bufferInfo = {0};
+-    bufferInfo.bufferName = bufferId;
+ 
++    /* Prepare export request */
++    struct mesa_glinterop_export_in objIn = {};
++    struct mesa_glinterop_export_out objOut = {};
++
++    objIn.version = 2;
++    objIn.target = GL_ARRAY_BUFFER;
++    objIn.obj = bufferId;
++
++    switch (flags) {
++    case CL_MEM_READ_ONLY:
++        objIn.access = MESA_GLINTEROP_ACCESS_READ_ONLY;
++        break;
++    case CL_MEM_WRITE_ONLY:
++        objIn.access = MESA_GLINTEROP_ACCESS_WRITE_ONLY;
++        break;
++    case CL_MEM_READ_WRITE:
++        objIn.access = MESA_GLINTEROP_ACCESS_READ_WRITE;
++        break;
++    default:
++        errorCode.set(CL_INVALID_VALUE);
++        return nullptr;
++    }
++
++    objOut.version = 2;
++
++    /* Call MESA interop */
+     GLSharingFunctionsLinux *sharingFunctions = context->getSharing<GLSharingFunctionsLinux>();
+-    if (sharingFunctions->acquireSharedBufferINTEL(&bufferInfo) == GL_FALSE) {
+-        errorCode.set(CL_INVALID_GL_OBJECT);
++
++    int retValue = sharingFunctions->exportObject(&objIn, &objOut);
++    if ((retValue != MESA_GLINTEROP_SUCCESS) || (objOut.version != 2)) {
++        switch (retValue) {
++        case MESA_GLINTEROP_INVALID_DISPLAY:
++        case MESA_GLINTEROP_INVALID_CONTEXT:
++            errorCode.set(CL_INVALID_CONTEXT);
++            break;
++        case MESA_GLINTEROP_INVALID_OBJECT:
++            errorCode.set(CL_INVALID_GL_OBJECT);
++            break;
++        case MESA_GLINTEROP_OUT_OF_HOST_MEMORY:
++            errorCode.set(CL_OUT_OF_HOST_MEMORY);
++            break;
++        case MESA_GLINTEROP_OUT_OF_RESOURCES:
++        default:
++            errorCode.set(CL_OUT_OF_RESOURCES);
++            break;
++        }
++
+         return nullptr;
+     }
+ 
++    /* Map result for rest of the function */
++    CL_GL_BUFFER_INFO bufferInfo = {};
++    bufferInfo.bufferName = bufferId;
++    bufferInfo.globalShareHandle = static_cast<unsigned int>(objOut.dmabuf_fd);
++    bufferInfo.bufferSize = static_cast<GLint>(objOut.buf_size);
++    bufferInfo.bufferOffset = static_cast<GLint>(objOut.buf_offset);
++
+     auto graphicsAllocation = GlBuffer::createGraphicsAllocation(context, bufferId, bufferInfo);
+     if (!graphicsAllocation) {
+         errorCode.set(CL_INVALID_GL_OBJECT);
+@@ -50,20 +102,36 @@ Buffer *GlBuffer::createSharedGlBuffer(Context *context, cl_mem_flags flags, uns
+ void GlBuffer::synchronizeObject(UpdateData &updateData) {
+     auto sharingFunctions = static_cast<GLSharingFunctionsLinux *>(this->sharingFunctions);
+ 
+-    CL_GL_BUFFER_INFO bufferInfo = {};
+-    bufferInfo.bufferName = this->clGlObjectId;
+-    sharingFunctions->acquireSharedBufferINTEL(&bufferInfo);
++    /* Prepare flush request */
++    struct mesa_glinterop_export_in objIn = {};
++    struct mesa_glinterop_flush_out syncOut = {};
++    int fenceFd = -1;
+ 
+-    auto graphicsAllocation = updateData.memObject->getGraphicsAllocation(updateData.rootDeviceIndex);
++    objIn.version = 2;
++    objIn.target = GL_ARRAY_BUFFER;
++    objIn.obj = this->clGlObjectId;
+ 
+-    updateData.sharedHandle = bufferInfo.globalShareHandle;
+-    updateData.synchronizationStatus = SynchronizeStatus::ACQUIRE_SUCCESFUL;
+-    graphicsAllocation->setAllocationOffset(bufferInfo.bufferOffset);
++    syncOut.version = 1;
++    syncOut.fence_fd = &fenceFd;
+ 
+-    const auto currentSharedHandle = graphicsAllocation->peekSharedHandle();
+-    if (currentSharedHandle != updateData.sharedHandle) {
+-        updateData.updateData = new CL_GL_BUFFER_INFO(bufferInfo);
++    /* Call MESA interop */
++    int retValue = sharingFunctions->flushObjects(1, &objIn, &syncOut);
++    if (retValue != MESA_GLINTEROP_SUCCESS) {
++        updateData.synchronizationStatus = SynchronizeStatus::SYNCHRONIZE_ERROR;
++        return;
+     }
++
++    /* Wait on the fence fd */
++    struct pollfd fp = {
++        .fd = fenceFd,
++        .events = POLLIN,
++        .revents = 0,
++    };
++    poll(&fp, 1, 1000);
++    close(fenceFd);
++
++    /* Done */
++    updateData.synchronizationStatus = SynchronizeStatus::ACQUIRE_SUCCESFUL;
+ }
+ 
+ void GlBuffer::resolveGraphicsAllocationChange(osHandle currentSharedHandle, UpdateData *updateData) {
+@@ -153,7 +221,7 @@ GraphicsAllocation *GlBuffer::createGraphicsAllocation(Context *context, unsigne
+                                            context->getDeviceBitfieldForAllocation(context->getDevice(0)->getRootDeviceIndex())};
+         // couldn't find allocation for reuse - create new
+         graphicsAllocation =
+-            context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(bufferInfo.globalShareHandle, properties, true, false, false, nullptr);
++            context->getMemoryManager()->createGraphicsAllocationFromSharedHandle(bufferInfo.globalShareHandle, properties, false, false, false, nullptr);
+     }
+ 
+     if (!graphicsAllocation) {
+@@ -167,6 +235,13 @@ GraphicsAllocation *GlBuffer::createGraphicsAllocation(Context *context, unsigne
+             DEBUG_BREAK_IF(graphicsAllocation->getDefaultGmm() != nullptr);
+             auto helper = context->getDevice(0)->getRootDeviceEnvironment().getGmmHelper();
+             graphicsAllocation->setDefaultGmm(new Gmm(helper, bufferInfo.pGmmResInfo));
++        } else {
++            auto helper = context->getDevice(0)->getRootDeviceEnvironment().getGmmHelper();
++            StorageInfo storageInfo = {};
++            GmmRequirements gmmRequirements{};
++
++            graphicsAllocation->setDefaultGmm(new Gmm(helper,
++                                                      nullptr, bufferInfo.bufferSize, 1, GMM_RESOURCE_USAGE_UNKNOWN, storageInfo, gmmRequirements));
+         }
+     }
+ 
+@@ -174,8 +249,6 @@ GraphicsAllocation *GlBuffer::createGraphicsAllocation(Context *context, unsigne
+ }
+ 
+ void GlBuffer::releaseResource(MemObj *memObject, uint32_t rootDeviceIndex) {
+-    auto sharingFunctions = static_cast<GLSharingFunctionsLinux *>(this->sharingFunctions);
+-    CL_GL_BUFFER_INFO bufferInfo = {};
+-    bufferInfo.bufferName = this->clGlObjectId;
+-    sharingFunctions->releaseSharedBufferINTEL(&bufferInfo);
++    auto memoryManager = memObject->getMemoryManager();
++    memoryManager->closeSharedHandle(memObject->getGraphicsAllocation(rootDeviceIndex));
+ }
+diff --git a/opencl/source/sharings/gl/linux/gl_context_guard_linux.cpp b/opencl/source/sharings/gl/linux/gl_context_guard_linux.cpp
+index 60085309d2ff..21389f3bf201 100644
+--- a/opencl/source/sharings/gl/linux/gl_context_guard_linux.cpp
++++ b/opencl/source/sharings/gl/linux/gl_context_guard_linux.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -10,29 +10,8 @@
+ 
+ namespace NEO {
+ GLContextGuard::GLContextGuard(GLSharingFunctions &sharingFcns) : sharingFunctions(&sharingFcns) {
+-    auto &sharing = *static_cast<GLSharingFunctionsLinux *>(sharingFunctions);
+-
+-    currentContextHandle = sharing.getCurrentContext();
+-    currentDisplayHandle = sharing.getCurrentDisplay();
+-    auto ctxToMakeCurrent = sharing.getContextHandle();
+-
+-    if (currentContextHandle == 0) {
+-        ctxToMakeCurrent = sharing.getBackupContextHandle();
+-    }
+-
+-    if (currentContextHandle != sharing.getContextHandle() && currentContextHandle != sharing.getBackupContextHandle()) {
+-        if (sharing.makeCurrent(ctxToMakeCurrent) == GL_FALSE) {
+-            while (sharing.makeCurrent(sharing.getBackupContextHandle()) == GL_FALSE) {
+-                ;
+-            }
+-        }
+-    }
+ }
+ 
+ GLContextGuard::~GLContextGuard() {
+-    auto &sharing = *static_cast<GLSharingFunctionsLinux *>(sharingFunctions);
+-    if (currentContextHandle != sharing.getContextHandle()) {
+-        sharing.makeCurrent(currentContextHandle, currentDisplayHandle);
+-    }
+ }
+ } // namespace NEO
+diff --git a/opencl/source/sharings/gl/linux/gl_library_linux.cpp b/opencl/source/sharings/gl/linux/gl_library_linux.cpp
+deleted file mode 100644
+index 8081d845fba2..000000000000
+--- a/opencl/source/sharings/gl/linux/gl_library_linux.cpp
++++ /dev/null
+@@ -1,13 +0,0 @@
+-/*
+- * Copyright (C) 2023 Intel Corporation
+- *
+- * SPDX-License-Identifier: MIT
+- *
+- */
+-
+-#include <cstdint>
+-
+-namespace Os {
+-const char *eglDllName = "libEGL.so.1";
+-const char *openglDllName = "libGL.so.1";
+-} // namespace Os
+diff --git a/opencl/source/sharings/gl/linux/gl_sharing_linux.cpp b/opencl/source/sharings/gl/linux/gl_sharing_linux.cpp
+index d39fc85788c3..5d00b7e18804 100644
+--- a/opencl/source/sharings/gl/linux/gl_sharing_linux.cpp
++++ b/opencl/source/sharings/gl/linux/gl_sharing_linux.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -11,43 +11,13 @@
+ #include "opencl/source/helpers/gl_helper.h"
+ #include "opencl/source/sharings/gl/gl_arb_sync_event.h"
+ 
+-namespace Os {
+-extern const char *eglDllName;
+-extern const char *openglDllName;
+-} // namespace Os
+-
+ namespace NEO {
+ GLSharingFunctionsLinux::GLSharingFunctionsLinux(GLType glhdcType, GLContext glhglrcHandle, GLContext glhglrcHandleBkpCtx, GLDisplay glhdcHandle)
+     : glHDCType(glhdcType), glHGLRCHandle(glhglrcHandle), glHGLRCHandleBkpCtx(glhglrcHandleBkpCtx), glHDCHandle(glhdcHandle) {
+     GLSharingFunctionsLinux::initGLFunctions();
+-    updateOpenGLContext();
+ }
+ GLSharingFunctionsLinux::~GLSharingFunctionsLinux() = default;
+ 
+-bool GLSharingFunctionsLinux::isGlSharingEnabled() {
+-    static bool oglLibAvailable = std::unique_ptr<OsLibrary>(OsLibrary::load(Os::eglDllName)).get() != nullptr;
+-    return oglLibAvailable;
+-}
+-
+-void GLSharingFunctionsLinux::createBackupContext() {
+-    if (pfnEglCreateContext) {
+-        glHGLRCHandleBkpCtx = pfnEglCreateContext(glHDCHandle);
+-        pfnEglShareLists(glHGLRCHandle, glHGLRCHandleBkpCtx);
+-    }
+-}
+-
+-GLboolean GLSharingFunctionsLinux::setSharedOCLContextState() {
+-    ContextInfo contextInfo{};
+-    GLboolean retVal = glSetSharedOCLContextState(glHDCHandle, glHGLRCHandle, CL_TRUE, &contextInfo);
+-    if (retVal == GL_FALSE) {
+-        return GL_FALSE;
+-    }
+-    glContextHandle = contextInfo.contextHandle;
+-    glDeviceHandle = contextInfo.deviceHandle;
+-
+-    return retVal;
+-}
+-
+ bool GLSharingFunctionsLinux::isOpenGlExtensionSupported(const unsigned char *pExtensionString) {
+     if (glGetStringi == nullptr || glGetIntegerv == nullptr) {
+         return false;
+@@ -123,26 +93,26 @@ void GLSharingFunctionsLinux::removeGlArbSyncEventMapping(Event &baseEvent) {
+ }
+ 
+ GLboolean GLSharingFunctionsLinux::initGLFunctions() {
+-    eglLibrary.reset(OsLibrary::load(Os::eglDllName));
+-    glLibrary.reset(OsLibrary::load(Os::openglDllName));
+-
+-    if (eglLibrary->isLoaded()) {
+-        GlFunctionHelper eglGetProc(eglLibrary.get(), "eglGetProcAddress");
+-        glGetCurrentContext = eglGetProc["eglGetCurrentContext"];
+-        glGetCurrentDisplay = eglGetProc["eglGetCurrentDisplay"];
+-        pfnEglCreateContext = eglGetProc["eglCreateContext"];
+-        pfnEglDeleteContext = eglGetProc["eglDestroyContext"];
+-        eglMakeCurrent = eglGetProc["eglMakeCurrent"];
+-        eglCreateImage = eglGetProc["eglCreateImage"];
+-        eglDestroyImage = eglGetProc["eglDestroyImage"];
+-        glAcquireSharedTexture = eglGetProc["eglExportDMABUFImageMESA"];
++    std::unique_ptr<OsLibrary> dynLibrary(OsLibrary::load(""));
++
++    GlFunctionHelper glXGetProc(dynLibrary.get(), "glXGetProcAddress");
++    if (glXGetProc.ready()) {
++        glXGLInteropQueryDeviceInfo = glXGetProc["glXGLInteropQueryDeviceInfoMESA"];
++        glXGLInteropExportObject = glXGetProc["glXGLInteropExportObjectMESA"];
++        glXGLInteropFlushObjects = glXGetProc["glXGLInteropFlushObjectsMESA"];
+     }
+-    if (glLibrary->isLoaded()) {
+-        glGetString = (*glLibrary)["glGetString"];
+-        glGetStringi = (*glLibrary)["glGetStringi"];
+-        glGetIntegerv = (*glLibrary)["glGetIntegerv"];
+-        glGetTexLevelParameteriv = (*glLibrary)["glGetTexLevelParameteriv"];
++
++    GlFunctionHelper eglGetProc(dynLibrary.get(), "eglGetProcAddress");
++    if (eglGetProc.ready()) {
++        eglGLInteropQueryDeviceInfo = eglGetProc["eglGLInteropQueryDeviceInfoMESA"];
++        eglGLInteropExportObject = eglGetProc["eglGLInteropExportObjectMESA"];
++        eglGLInteropFlushObjects = eglGetProc["eglGLInteropFlushObjectsMESA"];
+     }
++
++    glGetString = (*dynLibrary)["glGetString"];
++    glGetStringi = (*dynLibrary)["glGetStringi"];
++    glGetIntegerv = (*dynLibrary)["glGetIntegerv"];
++
+     this->pfnGlArbSyncObjectCleanup = cleanupArbSyncObject;
+     this->pfnGlArbSyncObjectSetup = setupArbSyncObject;
+     this->pfnGlArbSyncObjectSignal = signalArbSyncObject;
+diff --git a/opencl/source/sharings/gl/linux/gl_sharing_linux.h b/opencl/source/sharings/gl/linux/gl_sharing_linux.h
+index 952898fcc878..ca439cebe3fe 100644
+--- a/opencl/source/sharings/gl/linux/gl_sharing_linux.h
++++ b/opencl/source/sharings/gl/linux/gl_sharing_linux.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -11,57 +11,34 @@
+ #include "opencl/source/sharings/gl/gl_sharing.h"
+ #include "opencl/source/sharings/gl/linux/include/gl_types.h"
+ 
++#include "third_party/opengl_headers/GL/mesa_glinterop.h"
+ #include <GL/gl.h>
+ 
+ #include <EGL/eglext.h>
+ 
++typedef struct _XDisplay *GLXDisplay;
++typedef struct __GLXcontextRec *GLXContext;
++
+ namespace NEO {
+ // OpenGL API names
+-typedef GLboolean (*PFNOGLSetSharedOCLContextStateINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLboolean state, GLvoid *pContextInfo);
+-typedef GLboolean (*PFNOGLAcquireSharedBufferINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pBufferInfo);
+-typedef GLboolean (*PFNOGLAcquireSharedRenderBufferINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pResourceInfo);
+-typedef GLboolean (*PFNOGLReleaseSharedBufferINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pBufferInfo);
+-typedef GLboolean (*PFNOGLReleaseSharedRenderBufferINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pResourceInfo);
+-typedef GLboolean (*PFNOGLReleaseSharedTextureINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pResourceInfo);
+-typedef GLContext (*PFNOGLGetCurrentContext)();
+-typedef GLDisplay (*PFNOGLGetCurrentDisplay)();
+-typedef GLboolean (*PFNOGLMakeCurrent)(GLDisplay hdcHandle, void *draw, void *read, GLContext contextHandle);
+-typedef GLboolean (*PFNOGLRetainSyncINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pSyncInfo);
+-typedef GLboolean (*PFNOGLReleaseSyncINTEL)(GLDisplay hdcHandle, GLContext contextHandle, GLContext backupContextHandle, GLvoid *pSync);
+-typedef void (*PFNOGLGetSyncivINTEL)(GLvoid *pSync, GLenum pname, GLint *value);
+-
+ typedef const GLubyte *(*PFNglGetString)(GLenum name);
+ typedef const GLubyte *(*PFNglGetStringi)(GLenum name, GLuint index);
+ typedef void (*PFNglGetIntegerv)(GLenum pname, GLint *params);
+ typedef void (*PFNglBindTexture)(GLenum target, GLuint texture);
+-typedef void (*PFNglGetTexLevelParameteriv)(GLenum target, GLint level, GLenum pname, GLint *params);
+-
+-// egl
+-typedef unsigned char (*PFNeglMakeCurrent)(void *, void *);
+-typedef GLContext (*PFNeglCreateContext)(GLDisplay hdcHandle);
+-typedef int (*PFNeglShareLists)(GLContext contextHandle, GLContext backupContextHandle);
+-typedef EGLBoolean (*PFNeglDeleteContext)(EGLDisplay dpy, EGLContext ctx);
+ 
+ typedef bool (*PFNglArbSyncObjectSetup)(GLSharingFunctions &sharing, OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo);
+ typedef void (*PFNglArbSyncObjectCleanup)(OSInterface &osInterface, CL_GL_SYNC_INFO *glSyncInfo);
+ typedef void (*PFNglArbSyncObjectSignal)(OsContext &osContext, CL_GL_SYNC_INFO &glSyncInfo);
+ typedef void (*PFNglArbSyncObjectWaitServer)(OSInterface &osInterface, CL_GL_SYNC_INFO &glSyncInfo);
+ 
+-typedef EGLImage (*PFNeglCreateImage)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attribList);
+-typedef EGLBoolean (*PFNeglDestroyImage)(EGLDisplay dpy, EGLImage image);
+-
+ class GLSharingFunctionsLinux : public GLSharingFunctions {
+   public:
+     GLSharingFunctionsLinux() = default;
+     GLSharingFunctionsLinux(GLType glhdcType, GLContext glhglrcHandle, GLContext glhglrcHandleBkpCtx, GLDisplay glhdcHandle);
+     ~GLSharingFunctionsLinux() override;
+ 
+-    OS_HANDLE getGLDeviceHandle() const { return glDeviceHandle; }
+-    OS_HANDLE getGLContextHandle() const { return glContextHandle; }
+-
+     GLboolean initGLFunctions() override;
+     bool isOpenGlSharingSupported() override;
+-    static bool isGlSharingEnabled();
+ 
+     // Arb sync event
+     template <typename EventType = GlArbSyncEvent>
+@@ -70,62 +47,53 @@ class GLSharingFunctionsLinux : public GLSharingFunctions {
+     void removeGlArbSyncEventMapping(Event &baseEvent);
+ 
+     // Gl functions
+-    GLboolean acquireSharedBufferINTEL(GLvoid *pBufferInfo) {
+-        return glAcquireSharedBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pBufferInfo);
+-    }
+-    GLboolean releaseSharedBufferINTEL(GLvoid *pBufferInfo) {
+-        return glReleaseSharedBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pBufferInfo);
+-    }
+-    GLboolean acquireSharedRenderBuffer(GLvoid *pResourceInfo) {
+-        return glAcquireSharedRenderBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pResourceInfo);
+-    }
+-    GLboolean releaseSharedRenderBuffer(GLvoid *pResourceInfo) {
+-        return glReleaseSharedRenderBuffer(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pResourceInfo);
+-    }
+-    EGLBoolean acquireSharedTexture(CL_GL_RESOURCE_INFO *pResourceInfo) {
+-        int fds;
+-        int stride, offset;
+-        int miplevel = 0;
+-
+-        EGLAttrib attribList[] = {EGL_GL_TEXTURE_LEVEL, miplevel, EGL_NONE};
+-        EGLImage image = eglCreateImage(glHDCHandle, glHGLRCHandle, EGL_GL_TEXTURE_2D, reinterpret_cast<EGLClientBuffer>(static_cast<uintptr_t>(pResourceInfo->name)), &attribList[0]);
+-        if (image == EGL_NO_IMAGE) {
+-            return EGL_FALSE;
+-        }
+-
+-        EGLBoolean ret = glAcquireSharedTexture(glHDCHandle, image, &fds, &stride, &offset);
+-        if (ret == EGL_TRUE && fds > 0) {
+-            pResourceInfo->globalShareHandle = fds;
+-        } else {
+-            eglDestroyImage(glHDCHandle, image);
+-            ret = EGL_FALSE;
++    int queryDeviceInfo(struct mesa_glinterop_device_info *out) {
++        switch (glHDCType) {
++        case CL_GLX_DISPLAY_KHR:
++            return glXGLInteropQueryDeviceInfo(
++                reinterpret_cast<GLXDisplay>(glHDCHandle),
++                reinterpret_cast<GLXContext>(glHGLRCHandle),
++                out);
++        case CL_EGL_DISPLAY_KHR:
++            return eglGLInteropQueryDeviceInfo(
++                reinterpret_cast<EGLDisplay>(glHDCHandle),
++                reinterpret_cast<EGLContext>(glHGLRCHandle),
++                out);
++        default:
++            return -ENOTSUP;
+         }
+-
+-        return ret;
+-    }
+-    GLboolean releaseSharedTexture(GLvoid *pResourceInfo) {
+-        return 1;
+-    }
+-    GLboolean retainSync(GLvoid *pSyncInfo) {
+-        return glRetainSync(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pSyncInfo);
+-    }
+-    GLboolean releaseSync(GLvoid *pSync) {
+-        return glReleaseSync(glHDCHandle, glHGLRCHandle, glHGLRCHandleBkpCtx, pSync);
+-    }
+-    void getSynciv(GLvoid *pSync, GLenum pname, GLint *value) {
+-        return glGetSynciv(pSync, pname, value);
+     }
+-    GLContext getCurrentContext() {
+-        return glGetCurrentContext();
+-    }
+-    GLDisplay getCurrentDisplay() {
+-        return glGetCurrentDisplay();
++    int exportObject(struct mesa_glinterop_export_in *in, struct mesa_glinterop_export_out *out) {
++        switch (glHDCType) {
++        case CL_GLX_DISPLAY_KHR:
++            return glXGLInteropExportObject(
++                reinterpret_cast<GLXDisplay>(glHDCHandle),
++                reinterpret_cast<GLXContext>(glHGLRCHandle),
++                in, out);
++        case CL_EGL_DISPLAY_KHR:
++            return eglGLInteropExportObject(
++                reinterpret_cast<EGLDisplay>(glHDCHandle),
++                reinterpret_cast<EGLContext>(glHGLRCHandle),
++                in, out);
++        default:
++            return -ENOTSUP;
++        }
+     }
+-    GLboolean makeCurrent(GLContext contextHandle, GLDisplay displayHandle = 0) {
+-        if (displayHandle == 0) {
+-            displayHandle = glHDCHandle;
++    int flushObjects(unsigned count, struct mesa_glinterop_export_in *resources, struct mesa_glinterop_flush_out *out) {
++        switch (glHDCType) {
++        case CL_GLX_DISPLAY_KHR:
++            return glXGLInteropFlushObjects(
++                reinterpret_cast<GLXDisplay>(glHDCHandle),
++                reinterpret_cast<GLXContext>(glHGLRCHandle),
++                count, resources, out);
++        case CL_EGL_DISPLAY_KHR:
++            return eglGLInteropFlushObjects(
++                reinterpret_cast<EGLDisplay>(glHDCHandle),
++                reinterpret_cast<EGLContext>(glHGLRCHandle),
++                count, resources, out);
++        default:
++            return -ENOTSUP;
+         }
+-        return this->eglMakeCurrent(displayHandle, contextHandle);
+     }
+     GLContext getBackupContextHandle() {
+         return glHGLRCHandleBkpCtx;
+@@ -149,16 +117,7 @@ class GLSharingFunctionsLinux : public GLSharingFunctions {
+     std::mutex mutex;
+     std::vector<std::pair<unsigned int, GraphicsAllocation *>> graphicsAllocationsForGlBufferReuse;
+ 
+-    PFNglGetTexLevelParameteriv glGetTexLevelParameteriv = nullptr;
+-
+   protected:
+-    void updateOpenGLContext() {
+-        if (glSetSharedOCLContextState) {
+-            setSharedOCLContextState();
+-        }
+-    }
+-    GLboolean setSharedOCLContextState();
+-    void createBackupContext();
+     bool isOpenGlExtensionSupported(const unsigned char *pExtentionString);
+ 
+     // Handles
+@@ -166,37 +125,21 @@ class GLSharingFunctionsLinux : public GLSharingFunctions {
+     GLContext glHGLRCHandle = 0;
+     GLContext glHGLRCHandleBkpCtx = 0;
+     GLDisplay glHDCHandle = 0;
+-    OS_HANDLE glDeviceHandle = 0;
+-    OS_HANDLE glContextHandle = 0;
+ 
+     // GL functions
+-    std::unique_ptr<OsLibrary> glLibrary;
+-    std::unique_ptr<OsLibrary> eglLibrary;
+-    PFNOGLSetSharedOCLContextStateINTEL glSetSharedOCLContextState = nullptr;
+-    PFNOGLAcquireSharedBufferINTEL glAcquireSharedBuffer = nullptr;
+-    PFNOGLReleaseSharedBufferINTEL glReleaseSharedBuffer = nullptr;
+-    PFNOGLAcquireSharedRenderBufferINTEL glAcquireSharedRenderBuffer = nullptr;
+-    PFNOGLReleaseSharedRenderBufferINTEL glReleaseSharedRenderBuffer = nullptr;
+-    PFNEGLEXPORTDMABUFIMAGEMESAPROC glAcquireSharedTexture = nullptr;
+-    PFNOGLReleaseSharedTextureINTEL glReleaseSharedTexture = nullptr;
+-    PFNOGLGetCurrentContext glGetCurrentContext = nullptr;
+-    PFNOGLGetCurrentDisplay glGetCurrentDisplay = nullptr;
+     PFNglGetString glGetString = nullptr;
+     PFNglGetStringi glGetStringi = nullptr;
+     PFNglGetIntegerv glGetIntegerv = nullptr;
+-    PFNeglCreateContext pfnEglCreateContext = nullptr;
+-    PFNeglMakeCurrent eglMakeCurrent = nullptr;
+-    PFNeglShareLists pfnEglShareLists = nullptr;
+-    PFNeglDeleteContext pfnEglDeleteContext = nullptr;
+-    PFNOGLRetainSyncINTEL glRetainSync = nullptr;
+-    PFNOGLReleaseSyncINTEL glReleaseSync = nullptr;
+-    PFNOGLGetSyncivINTEL glGetSynciv = nullptr;
++    PFNMESAGLINTEROPGLXQUERYDEVICEINFOPROC glXGLInteropQueryDeviceInfo = nullptr;
++    PFNMESAGLINTEROPGLXEXPORTOBJECTPROC glXGLInteropExportObject = nullptr;
++    PFNMESAGLINTEROPGLXFLUSHOBJECTSPROC glXGLInteropFlushObjects = nullptr;
++    PFNMESAGLINTEROPEGLQUERYDEVICEINFOPROC eglGLInteropQueryDeviceInfo = nullptr;
++    PFNMESAGLINTEROPEGLEXPORTOBJECTPROC eglGLInteropExportObject = nullptr;
++    PFNMESAGLINTEROPEGLFLUSHOBJECTSPROC eglGLInteropFlushObjects = nullptr;
+     PFNglArbSyncObjectSetup pfnGlArbSyncObjectSetup = nullptr;
+     PFNglArbSyncObjectCleanup pfnGlArbSyncObjectCleanup = nullptr;
+     PFNglArbSyncObjectSignal pfnGlArbSyncObjectSignal = nullptr;
+     PFNglArbSyncObjectWaitServer pfnGlArbSyncObjectWaitServer = nullptr;
+-    PFNeglCreateImage eglCreateImage = nullptr;
+-    PFNeglDestroyImage eglDestroyImage = nullptr;
+     // support for GL_ARB_cl_event
+     std::mutex glArbEventMutex;
+     std::unordered_map<Event *, GlArbSyncEvent *> glArbEventMapping;
+diff --git a/opencl/source/sharings/gl/linux/gl_sync_event_linux.cpp b/opencl/source/sharings/gl/linux/gl_sync_event_linux.cpp
+index 6c539a7d52b9..3928de6094b9 100644
+--- a/opencl/source/sharings/gl/linux/gl_sync_event_linux.cpp
++++ b/opencl/source/sharings/gl/linux/gl_sync_event_linux.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -27,31 +27,15 @@ GlSyncEvent::GlSyncEvent(Context &context, const GL_CL_SYNC_INFO &sync)
+ }
+ 
+ GlSyncEvent::~GlSyncEvent() {
+-    ctx->getSharing<GLSharingFunctionsLinux>()->releaseSync(glSync->pSync);
+ }
+ 
+ GlSyncEvent *GlSyncEvent::create(Context &context, cl_GLsync sync, cl_int *errCode) {
+-    GLContextGuard guard(*context.getSharing<GLSharingFunctionsLinux>());
+-
+-    ErrorCodeHelper err(errCode, CL_SUCCESS);
+-    GL_CL_SYNC_INFO syncInfo = {sync, nullptr};
+-
+-    context.getSharing<GLSharingFunctionsLinux>()->retainSync(&syncInfo);
+-    DEBUG_BREAK_IF(!syncInfo.pSync);
+-
+-    EventBuilder eventBuilder;
+-    eventBuilder.create<GlSyncEvent>(context, syncInfo);
+-    return static_cast<GlSyncEvent *>(eventBuilder.finalizeAndRelease());
++    /* Not supported */
++    return nullptr;
+ }
+ 
+ void GlSyncEvent::updateExecutionStatus() {
+-    GLContextGuard guard(*ctx->getSharing<GLSharingFunctionsLinux>());
+-    int retVal = 0;
+-
+-    ctx->getSharing<GLSharingFunctionsLinux>()->getSynciv(glSync->pSync, GL_SYNC_STATUS, &retVal);
+-    if (retVal == GL_SIGNALED) {
+-        setStatus(CL_COMPLETE);
+-    }
++    /* Not supported */
+ }
+ 
+ TaskCountType GlSyncEvent::getTaskLevel() {
+diff --git a/opencl/source/sharings/gl/linux/gl_texture_linux.cpp b/opencl/source/sharings/gl/linux/gl_texture_linux.cpp
+index a23584500299..f2d6ccecba11 100644
+--- a/opencl/source/sharings/gl/linux/gl_texture_linux.cpp
++++ b/opencl/source/sharings/gl/linux/gl_texture_linux.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -29,6 +29,9 @@
+ #include "config.h"
+ #include <GL/gl.h>
+ 
++#include <poll.h>
++#include <unistd.h>
++
+ namespace NEO {
+ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl_GLenum target, cl_GLint miplevel, cl_GLuint texture,
+                                         cl_int *errcodeRet) {
+@@ -39,53 +42,93 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
+     cl_image_format imgFormat = {};
+     McsSurfaceInfo mcsSurfaceInfo = {};
+ 
+-    CL_GL_RESOURCE_INFO texInfo = {};
+-    texInfo.name = texture;
+-    texInfo.target = getBaseTargetType(target);
+-    if (texInfo.target != GL_TEXTURE_2D) {
+-        printf("target %x not supported\n", target);
+-        errorCode.set(CL_INVALID_GL_OBJECT);
+-        return nullptr;
+-    }
+-
+-    uint32_t qPitch = 0;
+-    uint32_t cubeFaceIndex = __GMM_NO_CUBE_MAP;
+-    int imageWidth = 0, imageHeight = 0, internalFormat = 0;
++    /* Prepare export request */
++    struct mesa_glinterop_export_in texIn = {};
++    struct mesa_glinterop_export_out texOut = {};
+ 
+-    GLSharingFunctionsLinux *sharingFunctions = context->getSharing<GLSharingFunctionsLinux>();
++    texIn.version = 2;
++    texIn.target = getBaseTargetType(target);
++    texIn.obj = texture;
++    texIn.miplevel = miplevel;
+ 
+-    sharingFunctions->glGetTexLevelParameteriv(target, miplevel, GL_TEXTURE_WIDTH, &imageWidth);
+-    sharingFunctions->glGetTexLevelParameteriv(target, miplevel, GL_TEXTURE_HEIGHT, &imageHeight);
+-    sharingFunctions->glGetTexLevelParameteriv(target, miplevel, GL_TEXTURE_INTERNAL_FORMAT, &internalFormat);
+-
+-    imgDesc.image_width = imageWidth;
+-    imgDesc.image_height = imageHeight;
+-    switch (internalFormat) {
+-    case GL_RGBA:
+-    case GL_RGBA8:
+-    case GL_RGBA16F:
+-    case GL_RGB:
+-        texInfo.glInternalFormat = internalFormat;
++    switch (flags) {
++    case CL_MEM_READ_ONLY:
++        texIn.access = MESA_GLINTEROP_ACCESS_READ_ONLY;
++        break;
++    case CL_MEM_WRITE_ONLY:
++        texIn.access = MESA_GLINTEROP_ACCESS_WRITE_ONLY;
++        break;
++    case CL_MEM_READ_WRITE:
++        texIn.access = MESA_GLINTEROP_ACCESS_READ_WRITE;
+         break;
+     default:
+-        printf("internal format %x not supported\n", internalFormat);
++        errorCode.set(CL_INVALID_VALUE);
++        return nullptr;
++    }
++
++    if (texIn.target != GL_TEXTURE_2D) {
++        printf("target %x not supported\n", target);
+         errorCode.set(CL_INVALID_GL_OBJECT);
+         return nullptr;
+     }
+ 
+-    imgInfo.imgDesc.imageWidth = imgDesc.image_width;
+-    imgInfo.imgDesc.imageType = ImageType::image2D;
+-    imgInfo.imgDesc.imageHeight = imgDesc.image_height;
++    texOut.version = 2;
+ 
+-    if (target == GL_RENDERBUFFER_EXT) {
+-        sharingFunctions->acquireSharedRenderBuffer(&texInfo);
+-    } else {
+-        if (sharingFunctions->acquireSharedTexture(&texInfo) != EGL_TRUE) {
++    /* Call MESA interop */
++    GLSharingFunctionsLinux *sharingFunctions = context->getSharing<GLSharingFunctionsLinux>();
++
++    int retValue = sharingFunctions->exportObject(&texIn, &texOut);
++    if ((retValue != MESA_GLINTEROP_SUCCESS) || (texOut.version != 2)) {
++        switch (retValue) {
++        case MESA_GLINTEROP_INVALID_DISPLAY:
++        case MESA_GLINTEROP_INVALID_CONTEXT:
++            errorCode.set(CL_INVALID_CONTEXT);
++            break;
++        case MESA_GLINTEROP_INVALID_TARGET:
++            errorCode.set(CL_INVALID_VALUE);
++            break;
++        case MESA_GLINTEROP_INVALID_MIP_LEVEL:
++            errorCode.set(CL_INVALID_MIP_LEVEL);
++            break;
++        case MESA_GLINTEROP_INVALID_OBJECT:
+             errorCode.set(CL_INVALID_GL_OBJECT);
+-            return nullptr;
++            break;
++        case MESA_GLINTEROP_UNSUPPORTED:
++            errorCode.set(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR);
++            break;
++        case MESA_GLINTEROP_INVALID_OPERATION:
++            errorCode.set(CL_INVALID_OPERATION);
++            break;
++        case MESA_GLINTEROP_OUT_OF_HOST_MEMORY:
++            errorCode.set(CL_OUT_OF_HOST_MEMORY);
++            break;
++        case MESA_GLINTEROP_OUT_OF_RESOURCES:
++        default:
++            errorCode.set(CL_OUT_OF_RESOURCES);
++            break;
+         }
+     }
+ 
++    /* Map result for rest of the function */
++    CL_GL_RESOURCE_INFO texInfo = {};
++    texInfo.name = texIn.obj,
++    texInfo.globalShareHandle = static_cast<unsigned int>(texOut.dmabuf_fd);
++    texInfo.glInternalFormat = static_cast<GLint>(texOut.internal_format);
++    texInfo.textureBufferSize = static_cast<GLint>(texOut.buf_size);
++    texInfo.textureBufferOffset = static_cast<GLint>(texOut.buf_offset);
++
++    imgDesc.image_width = texOut.width;
++    imgDesc.image_height = texOut.height;
++    imgDesc.image_depth = texOut.depth;
++    imgDesc.image_row_pitch = texOut.stride;
++
++    imgInfo.imgDesc.imageType = ImageType::image2D;
++    imgInfo.imgDesc.imageWidth = imgDesc.image_width;
++    imgInfo.imgDesc.imageHeight = imgDesc.image_height;
++    imgInfo.imgDesc.imageDepth = imgDesc.image_depth;
++    imgInfo.imgDesc.imageRowPitch = imgDesc.image_row_pitch;
++    imgInfo.linearStorage = (texOut.modifier == 0);
++
+     errorCode.set(CL_SUCCESS);
+ 
+     if (setClImageFormat(texInfo.glInternalFormat, imgFormat) == false) {
+@@ -117,10 +160,8 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
+ 
+     imgDesc.image_type = getClMemObjectType(target);
+     if (target == GL_TEXTURE_BUFFER) {
+-        imgDesc.image_width = texInfo.textureBufferWidth;
+         imgDesc.image_row_pitch = texInfo.textureBufferSize;
+-    } else {
+-        imgDesc.image_width = gmm->gmmResourceInfo->getBaseWidth();
++    } else if (imgDesc.image_row_pitch == 0) {
+         imgDesc.image_row_pitch = gmm->gmmResourceInfo->getRenderPitch();
+         if (imgDesc.image_row_pitch == 0) {
+             size_t alignedWidth = alignUp(imgDesc.image_width, gmm->gmmResourceInfo->getHAlign());
+@@ -148,9 +189,9 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
+         imgDesc.image_slice_pitch = alloc->getUnderlyingBufferSize();
+     }
+ 
+-    cubeFaceIndex = GmmTypesConverter::getCubeFaceIndex(target);
++    uint32_t cubeFaceIndex = GmmTypesConverter::getCubeFaceIndex(target);
+ 
+-    qPitch = gmm->queryQPitch(gmm->gmmResourceInfo->getResourceType());
++    uint32_t qPitch = gmm->queryQPitch(gmm->gmmResourceInfo->getResourceType());
+ 
+     GraphicsAllocation *mcsAlloc = nullptr;
+ 
+@@ -177,20 +218,37 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
+ 
+ void GlTexture::synchronizeObject(UpdateData &updateData) {
+     auto sharingFunctions = static_cast<GLSharingFunctionsLinux *>(this->sharingFunctions);
+-    CL_GL_RESOURCE_INFO resourceInfo = {0};
+-    resourceInfo.name = this->clGlObjectId;
+-    if (target == GL_RENDERBUFFER_EXT) {
+-        sharingFunctions->acquireSharedRenderBuffer(&resourceInfo);
+-    } else {
+-        if (sharingFunctions->acquireSharedTexture(&resourceInfo) == EGL_TRUE) {
+-            // Set texture buffer offset acquired from OpenGL layer in graphics allocation
+-            updateData.memObject->getGraphicsAllocation(updateData.rootDeviceIndex)->setAllocationOffset(resourceInfo.textureBufferOffset);
+-        } else {
+-            updateData.synchronizationStatus = SynchronizeStatus::SYNCHRONIZE_ERROR;
+-            return;
+-        }
++
++    /* Prepare flush request */
++    struct mesa_glinterop_export_in texIn = {};
++    struct mesa_glinterop_flush_out syncOut = {};
++    int fenceFd = -1;
++
++    texIn.version = 2;
++    texIn.target = this->target;
++    texIn.obj = this->clGlObjectId;
++    texIn.miplevel = this->miplevel;
++
++    syncOut.version = 1;
++    syncOut.fence_fd = &fenceFd;
++
++    /* Call MESA interop */
++    int retValue = sharingFunctions->flushObjects(1, &texIn, &syncOut);
++    if (retValue != MESA_GLINTEROP_SUCCESS) {
++        updateData.synchronizationStatus = SynchronizeStatus::SYNCHRONIZE_ERROR;
++        return;
+     }
+-    updateData.sharedHandle = resourceInfo.globalShareHandle;
++
++    /* Wait on the fence fd */
++    struct pollfd fp = {
++        .fd = fenceFd,
++        .events = POLLIN,
++        .revents = 0,
++    };
++    poll(&fp, 1, 1000);
++    close(fenceFd);
++
++    /* Done */
+     updateData.synchronizationStatus = SynchronizeStatus::ACQUIRE_SUCCESFUL;
+ }
+ 
+@@ -276,14 +334,8 @@ cl_GLenum GlTexture::getBaseTargetType(cl_GLenum target) {
+ }
+ 
+ void GlTexture::releaseResource(MemObj *memObject, uint32_t rootDeviceIndex) {
+-    auto sharingFunctions = static_cast<GLSharingFunctionsLinux *>(this->sharingFunctions);
+-    if (target == GL_RENDERBUFFER_EXT) {
+-        sharingFunctions->releaseSharedRenderBuffer(&textureInfo);
+-    } else {
+-        sharingFunctions->releaseSharedTexture(&textureInfo);
+-        auto memoryManager = memObject->getMemoryManager();
+-        memoryManager->closeSharedHandle(memObject->getGraphicsAllocation(rootDeviceIndex));
+-    }
++    auto memoryManager = memObject->getMemoryManager();
++    memoryManager->closeSharedHandle(memObject->getGraphicsAllocation(rootDeviceIndex));
+ }
+ void GlTexture::resolveGraphicsAllocationChange(osHandle currentSharedHandle, UpdateData *updateData) {
+     const auto memObject = updateData->memObject;
+diff --git a/opencl/source/sharings/gl/linux/include/gl_types.h b/opencl/source/sharings/gl/linux/include/gl_types.h
+index 6f1f97e0b661..f2437adb0b29 100644
+--- a/opencl/source/sharings/gl/linux/include/gl_types.h
++++ b/opencl/source/sharings/gl/linux/include/gl_types.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2022-2023 Intel Corporation
++ * Copyright (C) 2022-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -7,7 +7,7 @@
+ 
+ #include <EGL/egl.h>
+ 
+-using GLDisplay = EGLDisplay;
+-using GLContext = EGLContext;
++typedef void *GLDisplay;
++typedef void *GLContext;
+ using GLType = uint32_t;
+ using GLFunctionType = decltype(&eglGetProcAddress);
+diff --git a/opencl/source/sharings/gl/linux/lin_enable_gl.cpp b/opencl/source/sharings/gl/linux/lin_enable_gl.cpp
+index a1b9b2deccf4..7f9d13be5ff7 100644
+--- a/opencl/source/sharings/gl/linux/lin_enable_gl.cpp
++++ b/opencl/source/sharings/gl/linux/lin_enable_gl.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2023 Intel Corporation
++ * Copyright (C) 2023-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -37,6 +37,10 @@ bool GlSharingContextBuilder::processProperties(cl_context_properties &propertyT
+     case CL_GL_CONTEXT_KHR:
+         contextData->glHGLRCHandle = reinterpret_cast<GLContext>(propertyValue);
+         return true;
++    case CL_GLX_DISPLAY_KHR:
++        contextData->glHDCType = static_cast<GLType>(CL_GLX_DISPLAY_KHR);
++        contextData->glHDCHandle = reinterpret_cast<GLDisplay>(propertyValue);
++        return true;
+     case CL_EGL_DISPLAY_KHR:
+         contextData->glHDCType = static_cast<GLType>(CL_EGL_DISPLAY_KHR);
+         contextData->glHDCHandle = reinterpret_cast<GLDisplay>(propertyValue);
+@@ -54,6 +58,7 @@ bool GlSharingContextBuilder::finalizeProperties(Context &context, int32_t &errc
+                                                             nullptr, contextData->glHDCHandle));
+     }
+ 
++    contextData.reset(nullptr);
+     return true;
+ }
+ 
+@@ -76,17 +81,19 @@ void GlSharingBuilderFactory::fillGlobalDispatchTable() {
+ }
+ 
+ std::string GlSharingBuilderFactory::getExtensions(DriverInfo *driverInfo) {
+-    if (debugManager.flags.AddClGlSharing.get()) {
+-        return "cl_khr_gl_sharing "
+-               "cl_khr_gl_depth_images "
+-               "cl_khr_gl_event "
+-               "cl_khr_gl_msaa_sharing ";
+-    } else if (GLSharingFunctionsLinux::isGlSharingEnabled()) {
++    auto isGlSharingEnabled = true;
++
++    if (debugManager.flags.AddClGlSharing.get() != -1) {
++        isGlSharingEnabled = debugManager.flags.AddClGlSharing.get();
++    }
++
++    if (isGlSharingEnabled) {
+         return "cl_khr_gl_sharing "
+                "cl_khr_gl_depth_images "
+                "cl_khr_gl_event "
+                "cl_khr_gl_msaa_sharing ";
+     }
++
+     return "";
+ }
+ 
+diff --git a/opencl/test/unit_test/mock_gl/linux/mock_opengl.cpp b/opencl/test/unit_test/mock_gl/linux/mock_opengl.cpp
+index 02592d6196e3..285bdd68b0f8 100644
+--- a/opencl/test/unit_test/mock_gl/linux/mock_opengl.cpp
++++ b/opencl/test/unit_test/mock_gl/linux/mock_opengl.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2018-2023 Intel Corporation
++ * Copyright (C) 2018-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -15,45 +15,11 @@ extern "C" {
+ const char *glString = "Intel";
+ const char *glVersion = "4.0";
+ const char *arrayStringi[2]{"GL_OES_framebuffer_object", "GL_EXT_framebuffer_object"};
+-int glAcquireSharedBufferCalled = 0;
+-int glAcquireSharedRenderBufferCalled = 0;
+-int glAcquireSharedTextureCalled = 0;
+-int glDeleteContextCalled = 0;
+-int glGetCurrentContextCalled = 0;
+-int glGetCurrentDisplayCalled = 0;
+-int glGetSyncivCalled = 0;
+-int glMakeCurrentCalled = 0;
+-int glReleaseSharedBufferCalled = 0;
+-int glReleaseSharedRenderBufferCalled = 0;
+-int glReleaseSharedTextureCalled = 0;
+-int glReleaseSyncCalled = 0;
+-int glRetainSyncCalled = 0;
+-int eglCreateContextCalled = 0;
+-int eglDeleteContextCalled = 0;
+-int eglShareListsCalled = 0;
+ CL_GL_BUFFER_INFO bufferInfoInput = {0};
+ CL_GL_BUFFER_INFO bufferInfoOutput = {0};
+ CL_GL_RESOURCE_INFO textureInfoInput = {0};
+ CL_GL_RESOURCE_INFO textureInfoOutput = {0};
+ GLboolean glSetSharedOCLContextStateReturnedValue = 1u;
+-static const auto mockImage = reinterpret_cast<void *>(0xEEEE);
+-
+-void glGetTexLevelParameteriv(GLenum target,
+-                              GLint level,
+-                              GLenum pname,
+-                              GLint *params) {
+-    switch (pname) {
+-    case GL_TEXTURE_WIDTH:
+-        *params = 256;
+-        break;
+-    case GL_TEXTURE_HEIGHT:
+-        *params = 256;
+-        break;
+-    case GL_TEXTURE_INTERNAL_FORMAT:
+-        *params = GL_RGBA;
+-        break;
+-    }
+-};
+ 
+ const unsigned char *glGetString(unsigned int name) {
+     if (name == GL_VENDOR)
+@@ -63,174 +29,10 @@ const unsigned char *glGetString(unsigned int name) {
+     return reinterpret_cast<const unsigned char *>("");
+ };
+ 
+-EGLBoolean eglExportDMABUFImageMESA(EGLDisplay dpy, EGLImageKHR image, int *fds, EGLint *strides, EGLint *offsets) {
+-    glAcquireSharedTextureCalled++;
+-    if (image == mockImage) {
+-        *fds = 10;
+-        textureInfoInput.name = 1;
+-        return GL_TRUE;
+-    } else {
+-        return GL_FALSE;
+-    }
+-};
+-
+-void *eglGetCurrentContext() {
+-    glGetCurrentContextCalled++;
+-    return nullptr;
+-};
+-void *eglGetCurrentDisplay() {
+-    glGetCurrentDisplayCalled++;
+-    return nullptr;
+-};
+-
+-EGLAPI EGLContext EGLAPIENTRY eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext shareContext, const EGLint *attribList) {
+-    eglCreateContextCalled++;
+-    return (GLContext)0x101;
+-};
+-EGLBoolean eglDestroyContext(EGLDisplay display, EGLContext context) {
+-    eglDeleteContextCalled++;
+-    glDeleteContextCalled++;
+-    return (GLboolean)1;
+-};
+ void glGetIntegerv(GLenum pname, GLint *params) { return NEO::MockGLSharingFunctions::glGetIntegervTest(pname, params); };
+-unsigned char eglShareLists(void *arg1, void *arg2) {
+-    eglShareListsCalled++;
+-    return 1;
+-};
+ 
+-EGLAPI EGLBoolean EGLAPIENTRY eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext arg2) {
+-    glMakeCurrentCalled++;
+-    return EGL_TRUE;
+-};
+-
+-EGLImage eglCreateImage(EGLDisplay display, EGLContext context, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attribList) {
+-    return mockImage;
+-}
+-
+-EGLBoolean eglDestroyImage(EGLDisplay dpy, EGLImage image) {
+-    if (image == mockImage)
+-        return EGL_TRUE;
+-    else
+-        return EGL_FALSE;
+-}
+-
+-void resetParam(const char *name) {
+-    if (strcmp(name, "GLAcquireSharedBufferCalled") == 0) {
+-        glAcquireSharedBufferCalled = 0;
+-    }
+-    if (strcmp(name, "GLAcquireSharedRenderBufferCalled") == 0) {
+-        glAcquireSharedRenderBufferCalled = 0;
+-    }
+-    if (strcmp(name, "GLAcquireSharedTextureCalled") == 0) {
+-        glAcquireSharedTextureCalled = 0;
+-    }
+-    if (strcmp(name, "GLDeleteContextCalled") == 0) {
+-        glDeleteContextCalled = 0;
+-    }
+-    if (strcmp(name, "GLGetCurrentContextCalled") == 0) {
+-        glGetCurrentContextCalled = 0;
+-    }
+-    if (strcmp(name, "GLGetCurrentDisplayCalled") == 0) {
+-        glGetCurrentDisplayCalled = 0;
+-    }
+-    if (strcmp(name, "GLGetSyncivCalled") == 0) {
+-        glGetSyncivCalled = 0;
+-    }
+-    if (strcmp(name, "GLMakeCurrentCalled") == 0) {
+-        glMakeCurrentCalled = 0;
+-    }
+-    if (strcmp(name, "GLReleaseSharedBufferCalled") == 0) {
+-        glReleaseSharedBufferCalled = 0;
+-    }
+-    if (strcmp(name, "GLReleaseSharedRenderBufferCalled") == 0) {
+-        glReleaseSharedRenderBufferCalled = 0;
+-    }
+-    if (strcmp(name, "GLReleaseSharedTextureCalled") == 0) {
+-        glReleaseSharedTextureCalled = 0;
+-    }
+-    if (strcmp(name, "GLReleaseSyncCalled") == 0) {
+-        glReleaseSyncCalled = 0;
+-    }
+-    if (strcmp(name, "GLRetainSyncCalled") == 0) {
+-        glRetainSyncCalled = 0;
+-    }
+-    if (strcmp(name, "EGLCreateContextCalled") == 0) {
+-        eglCreateContextCalled = 0;
+-    }
+-    if (strcmp(name, "EGLDeleteContextCalled") == 0) {
+-        eglDeleteContextCalled = 0;
+-    }
+-    if (strcmp(name, "EGLShareListsCalled") == 0) {
+-        eglShareListsCalled = 0;
+-    }
+-    if (strcmp(name, "") == 0) {
+-        glAcquireSharedBufferCalled = 0;
+-        glAcquireSharedRenderBufferCalled = 0;
+-        glAcquireSharedTextureCalled = 0;
+-        glDeleteContextCalled = 0;
+-        glGetCurrentContextCalled = 0;
+-        glGetCurrentDisplayCalled = 0;
+-        glGetSyncivCalled = 0;
+-        glMakeCurrentCalled = 0;
+-        glReleaseSharedBufferCalled = 0;
+-        glReleaseSharedRenderBufferCalled = 0;
+-        glReleaseSharedTextureCalled = 0;
+-        glReleaseSyncCalled = 0;
+-        glRetainSyncCalled = 0;
+-        eglCreateContextCalled = 0;
+-        eglDeleteContextCalled = 0;
+-        eglShareListsCalled = 0;
+-    }
+-};
++void resetParam(const char *name){};
+ int getParam(const char *name) {
+-    if (strcmp(name, "GLAcquireSharedBufferCalled") == 0) {
+-        return glAcquireSharedBufferCalled;
+-    }
+-    if (strcmp(name, "GLAcquireSharedRenderBufferCalled") == 0) {
+-        return glAcquireSharedRenderBufferCalled;
+-    }
+-    if (strcmp(name, "GLAcquireSharedTextureCalled") == 0) {
+-        return glAcquireSharedTextureCalled;
+-    }
+-    if (strcmp(name, "GLDeleteContextCalled") == 0) {
+-        return glDeleteContextCalled;
+-    }
+-    if (strcmp(name, "GLGetCurrentContextCalled") == 0) {
+-        return glGetCurrentContextCalled;
+-    }
+-    if (strcmp(name, "GLGetCurrentDisplayCalled") == 0) {
+-        return glGetCurrentDisplayCalled;
+-    }
+-    if (strcmp(name, "GLGetSyncivCalled") == 0) {
+-        return glGetSyncivCalled;
+-    }
+-    if (strcmp(name, "GLMakeCurrentCalled") == 0) {
+-        return glMakeCurrentCalled;
+-    }
+-    if (strcmp(name, "GLReleaseSharedBufferCalled") == 0) {
+-        return glReleaseSharedBufferCalled;
+-    }
+-    if (strcmp(name, "GLReleaseSharedRenderBufferCalled") == 0) {
+-        return glReleaseSharedRenderBufferCalled;
+-    }
+-    if (strcmp(name, "GLReleaseSharedTextureCalled") == 0) {
+-        return glReleaseSharedTextureCalled;
+-    }
+-    if (strcmp(name, "GLReleaseSyncCalled") == 0) {
+-        return glReleaseSyncCalled;
+-    }
+-    if (strcmp(name, "GLRetainSyncCalled") == 0) {
+-        return glRetainSyncCalled;
+-    }
+-    if (strcmp(name, "EGLCreateContextCalled") == 0) {
+-        return eglCreateContextCalled;
+-    }
+-    if (strcmp(name, "EGLDeleteContextCalled") == 0) {
+-        return eglDeleteContextCalled;
+-    }
+-    if (strcmp(name, "EGLShareListsCalled") == 0) {
+-        return eglShareListsCalled;
+-    }
+     return 0;
+ };
+ CL_GL_BUFFER_INFO getBufferInfo() { return bufferInfoInput; };
+@@ -255,25 +57,6 @@ void setGLSetSharedOCLContextStateReturnedValue(GLboolean value) { glSetSharedOC
+ GLboolean getGLSetSharedOCLContextStateReturnedValue() { return glSetSharedOCLContextStateReturnedValue; };
+ 
+ EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress(const char *procname) {
+-
+-    std::string functionName(procname);
+-    if (functionName == "eglGetCurrentContext") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglGetCurrentContext);
+-    } else if (functionName == "eglGetCurrentDisplay") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglGetCurrentDisplay);
+-    } else if (functionName == "eglCreateContext") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglCreateContext);
+-    } else if (functionName == "eglDestroyContext") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglDestroyContext);
+-    } else if (functionName == "eglMakeCurrent") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglMakeCurrent);
+-    } else if (functionName == "eglCreateImage") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglCreateImage);
+-    } else if (functionName == "eglDestroyImage") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglDestroyImage);
+-    } else if (functionName == "eglExportDMABUFImageMESA") {
+-        return reinterpret_cast<__eglMustCastToProperFunctionPointerType EGLAPIENTRY>(eglExportDMABUFImageMESA);
+-    }
+     return nullptr;
+ }
+ }
+diff --git a/opencl/test/unit_test/mocks/gl/linux/mock_gl_sharing_linux.h b/opencl/test/unit_test/mocks/gl/linux/mock_gl_sharing_linux.h
+index ad494fc629c8..354e139560fe 100644
+--- a/opencl/test/unit_test/mocks/gl/linux/mock_gl_sharing_linux.h
++++ b/opencl/test/unit_test/mocks/gl/linux/mock_gl_sharing_linux.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2020-2023 Intel Corporation
++ * Copyright (C) 2020-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -29,31 +29,16 @@ class GlSharingFunctionsMock : public GLSharingFunctionsLinux {
+   public:
+     ~GlSharingFunctionsMock() override = default;
+ 
+-    using GLSharingFunctionsLinux::eglMakeCurrent;
+-    using GLSharingFunctionsLinux::glAcquireSharedBuffer;
+-    using GLSharingFunctionsLinux::glAcquireSharedRenderBuffer;
+-    using GLSharingFunctionsLinux::glAcquireSharedTexture;
+-    using GLSharingFunctionsLinux::glGetCurrentContext;
+-    using GLSharingFunctionsLinux::glGetCurrentDisplay;
++    using GLSharingFunctionsLinux::eglGLInteropExportObject;
++    using GLSharingFunctionsLinux::eglGLInteropFlushObjects;
++    using GLSharingFunctionsLinux::eglGLInteropQueryDeviceInfo;
++
+     using GLSharingFunctionsLinux::glGetIntegerv;
+     using GLSharingFunctionsLinux::glGetString;
+     using GLSharingFunctionsLinux::glGetStringi;
+-    using GLSharingFunctionsLinux::glGetSynciv;
+-    using GLSharingFunctionsLinux::glReleaseSharedBuffer;
+-    using GLSharingFunctionsLinux::glReleaseSharedRenderBuffer;
+-    using GLSharingFunctionsLinux::glReleaseSharedTexture;
+-    using GLSharingFunctionsLinux::glReleaseSync;
+-    using GLSharingFunctionsLinux::glRetainSync;
+-    using GLSharingFunctionsLinux::glSetSharedOCLContextState;
+     using GLSharingFunctionsLinux::isOpenGlExtensionSupported;
+-    using GLSharingFunctionsLinux::pfnEglCreateContext;
+-    using GLSharingFunctionsLinux::pfnEglDeleteContext;
+-    using GLSharingFunctionsLinux::pfnEglShareLists;
+-    using GLSharingFunctionsLinux::setSharedOCLContextState;
+ 
+     using GLSharingFunctionsLinux::glArbEventMapping;
+-    using GLSharingFunctionsLinux::glContextHandle;
+-    using GLSharingFunctionsLinux::glDeviceHandle;
+ 
+     using GLSharingFunctionsLinux::getSupportedFormats;
+     using GLSharingFunctionsLinux::pfnGlArbSyncObjectCleanup;
+@@ -64,8 +49,6 @@ class GlSharingFunctionsMock : public GLSharingFunctionsLinux {
+     GlSharingFunctionsMock(GLType glHDCType, GLContext glHGLRCHandle, GLContext glHGLRCHandleBkpCtx, GLDisplay glHDCHandle)
+         : GLSharingFunctionsLinux(glHDCType, glHGLRCHandle, glHGLRCHandleBkpCtx, glHDCHandle) {
+         initMembers();
+-        updateOpenGLContext();
+-        createBackupContext();
+     }
+     GlSharingFunctionsMock();
+ 
+@@ -76,9 +59,11 @@ class GlSharingFunctionsMock : public GLSharingFunctionsLinux {
+         this->glHDCHandle = glHDCHandle;
+     }
+ 
+-    void setGLAcquireSharedBufferMock(PFNOGLAcquireSharedBufferINTEL mock) { glAcquireSharedBuffer = mock; }
++    void setGLInteropQueryDeviceInfoMock(PFNMESAGLINTEROPEGLQUERYDEVICEINFOPROC mock) { eglGLInteropQueryDeviceInfo = mock; }
++
++    void setGLInteropExportObjectMock(PFNMESAGLINTEROPEGLEXPORTOBJECTPROC mock) { eglGLInteropExportObject = mock; }
+ 
+-    void setGLAcquireSharedTextureMock(PFNEGLEXPORTDMABUFIMAGEMESAPROC mock) { glAcquireSharedTexture = mock; }
++    void setGLInteropFlushObjectsMock(PFNMESAGLINTEROPEGLFLUSHOBJECTSPROC mock) { eglGLInteropFlushObjects = mock; }
+ };
+ 
+ class MockGlSharing {
+@@ -117,7 +102,6 @@ class MockGlSharing {
+ class MockGLSharingFunctions : public GLSharingFunctionsLinux {
+   public:
+     using GLSharingFunctionsLinux::isOpenGlExtensionSupported;
+-    using GLSharingFunctionsLinux::setSharedOCLContextState;
+ 
+     static void glGetIntegervTest(GLenum pname, GLint *data) {
+         if (pname == GL_NUM_EXTENSIONS)
+diff --git a/opencl/test/unit_test/sharings/gl/linux/CMakeLists.txt b/opencl/test/unit_test/sharings/gl/linux/CMakeLists.txt
+index 109718e8c159..ab8ef905940a 100644
+--- a/opencl/test/unit_test/sharings/gl/linux/CMakeLists.txt
++++ b/opencl/test/unit_test/sharings/gl/linux/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (C) 2022-2023 Intel Corporation
++# Copyright (C) 2022-2024 Intel Corporation
+ #
+ # SPDX-License-Identifier: MIT
+ #
+@@ -8,11 +8,9 @@ if(UNIX)
+   set(IGDRCL_SRCS_tests_sharings_gl_linux
+       ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_arb_sync_event_tests.cpp
+-      ${CMAKE_CURRENT_SOURCE_DIR}/gl_create_from_texture_tests.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_library_name.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_sharing_enable_tests.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_sharing_tests.cpp
+-      ${CMAKE_CURRENT_SOURCE_DIR}/gl_texture_tests.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/gl_types_tests.cpp
+   )
+   target_sources(igdrcl_tests PRIVATE ${IGDRCL_SRCS_tests_sharings_gl_linux})
+diff --git a/opencl/test/unit_test/sharings/gl/linux/gl_create_from_texture_tests.cpp b/opencl/test/unit_test/sharings/gl/linux/gl_create_from_texture_tests.cpp
+deleted file mode 100644
+index 6523bc2311ba..000000000000
+--- a/opencl/test/unit_test/sharings/gl/linux/gl_create_from_texture_tests.cpp
++++ /dev/null
+@@ -1,276 +0,0 @@
+-/*
+- * Copyright (C) 2018-2023 Intel Corporation
+- *
+- * SPDX-License-Identifier: MIT
+- *
+- */
+-
+-#include "shared/source/helpers/aligned_memory.h"
+-#include "shared/source/helpers/get_info.h"
+-#include "shared/source/memory_manager/os_agnostic_memory_manager.h"
+-#include "shared/test/common/libult/ult_command_stream_receiver.h"
+-#include "shared/test/common/mocks/mock_execution_environment.h"
+-#include "shared/test/common/mocks/mock_gmm.h"
+-#include "shared/test/common/mocks/mock_gmm_resource_info.h"
+-#include "shared/test/common/test_macros/test.h"
+-
+-#include "opencl/source/cl_device/cl_device.h"
+-#include "opencl/source/helpers/gmm_types_converter.h"
+-#include "opencl/source/mem_obj/image.h"
+-#include "opencl/source/sharings/gl/gl_texture.h"
+-#include "opencl/test/unit_test/mocks/gl/linux/mock_gl_sharing_linux.h"
+-#include "opencl/test/unit_test/mocks/mock_context.h"
+-
+-#include "gtest/gtest.h"
+-
+-namespace NEO {
+-class CreateFromGlTexture : public ::testing::Test {
+-  public:
+-    class TempMM : public OsAgnosticMemoryManager {
+-      public:
+-        TempMM() : OsAgnosticMemoryManager(*(new MockExecutionEnvironment(defaultHwInfo.get()))) {
+-            mockExecutionEnvironment.reset(&executionEnvironment);
+-            executionEnvironment.rootDeviceEnvironments[0]->initGmm();
+-        }
+-        GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+-            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(handle, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
+-            if (handle == CreateFromGlTexture::mcsHandle) {
+-                alloc->setDefaultGmm(forceMcsGmm);
+-            } else {
+-                if (alloc->getDefaultGmm()) {
+-                    delete alloc->getDefaultGmm();
+-                }
+-                alloc->setDefaultGmm(forceGmm);
+-            }
+-            return alloc;
+-        }
+-        size_t forceAllocationSize;
+-        Gmm *forceGmm = nullptr;
+-        Gmm *forceMcsGmm = nullptr;
+-        std::unique_ptr<ExecutionEnvironment> mockExecutionEnvironment;
+-    };
+-
+-    void SetUp() override {
+-        imgDesc = {};
+-        imgInfo = {};
+-        clContext.setSharingFunctions(glSharing->sharingFunctions.release());
+-        clContext.memoryManager = &tempMM;
+-    }
+-
+-    void TearDown() override {
+-        gmm.release();
+-        mcsGmm.release();
+-    }
+-
+-    void updateImgInfoAndForceGmm() {
+-        imgInfo = MockGmm::initImgInfo(imgDesc, 0, nullptr);
+-        gmm = MockGmm::queryImgParams(clContext.getDevice(0)->getGmmHelper(), imgInfo, false);
+-
+-        tempMM.forceAllocationSize = imgInfo.size;
+-        tempMM.forceGmm = gmm.get();
+-
+-        if (glSharing->textureInfoOutput.globalShareHandleMCS != 0) {
+-            ImageDescriptor mcsImgDesc = {};
+-            mcsImgDesc.imageHeight = 128;
+-            mcsImgDesc.imageRowPitch = 256;
+-            mcsImgDesc.imageWidth = 128;
+-            mcsImgDesc.imageType = ImageType::image2D;
+-            auto mcsImgInfo = MockGmm::initImgInfo(mcsImgDesc, 0, nullptr);
+-            mcsGmm = MockGmm::queryImgParams(clContext.getDevice(0)->getGmmHelper(), mcsImgInfo, false);
+-            tempMM.forceMcsGmm = mcsGmm.get();
+-        }
+-    }
+-
+-    ImageDescriptor imgDesc;
+-    ImageInfo imgInfo = {};
+-    std::unique_ptr<Gmm> gmm;
+-    std::unique_ptr<Gmm> mcsGmm;
+-    TempMM tempMM;
+-    MockContext clContext;
+-    std::unique_ptr<MockGlSharing> glSharing = std::make_unique<MockGlSharing>();
+-    cl_int retVal;
+-    static const unsigned int mcsHandle = 0xFF;
+-};
+-
+-class CreateFromGlTextureTestsWithParams : public CreateFromGlTexture,
+-                                           public ::testing::WithParamInterface<unsigned int /*cl_GLenum*/> {
+-};
+-
+-class CreateFromGlTextureTests : public CreateFromGlTexture {
+-};
+-
+-INSTANTIATE_TEST_CASE_P(
+-    CreateFromGlTextureTestsWithParams,
+-    CreateFromGlTextureTestsWithParams,
+-    testing::ValuesIn(glTextureTargets::supportedTargets));
+-
+-TEST_P(CreateFromGlTextureTestsWithParams, givenAllTextureSpecificParamsWhenCreateIsCalledThenFillImageDescription) {
+-    unsigned int target = GetParam();
+-    unsigned int baseTarget = GlTexture::getBaseTargetType(target);
+-    imgDesc.imageType = Image::convertType(GlTexture::getClMemObjectType(target));
+-    imgDesc.imageWidth = 5;
+-    if (target == GL_TEXTURE_1D_ARRAY || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+-        imgDesc.imageArraySize = 5;
+-    }
+-    if (target == GL_TEXTURE_2D || target == GL_TEXTURE_RECTANGLE ||
+-        target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_3D ||
+-        target == GL_RENDERBUFFER_EXT || baseTarget == GL_TEXTURE_CUBE_MAP_ARB ||
+-        target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+-        imgDesc.imageHeight = 5;
+-    }
+-
+-    if (target == GL_TEXTURE_3D) {
+-        imgDesc.imageDepth = 5;
+-    }
+-
+-    if (target == GL_TEXTURE_BUFFER) {
+-        // size and width for texture buffer are queried from textureInfo - not from gmm
+-        glSharing->textureInfoOutput.textureBufferWidth = 64;
+-        glSharing->textureInfoOutput.textureBufferSize = 1024;
+-        glSharing->uploadDataToTextureInfo();
+-    }
+-
+-    if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+-        imgDesc.numSamples = 16;
+-        glSharing->textureInfoOutput.numberOfSamples = 16;
+-        glSharing->textureInfoOutput.globalShareHandleMCS = CreateFromGlTexture::mcsHandle;
+-        glSharing->uploadDataToTextureInfo();
+-    }
+-
+-    updateImgInfoAndForceGmm();
+-
+-    auto glImage = GlTexture::createSharedGlTexture(&clContext, (cl_mem_flags)0, target, 0, 0, &retVal);
+-
+-    ASSERT_EQ(CL_SUCCESS, retVal);
+-    if (target == GL_RENDERBUFFER_EXT) {
+-        EXPECT_EQ(1, glSharing->dllParam->getParam("GLAcquireSharedRenderBufferCalled"));
+-    } else {
+-        EXPECT_EQ(1, glSharing->dllParam->getParam("GLAcquireSharedTextureCalled"));
+-    }
+-
+-    EXPECT_EQ(GmmTypesConverter::getCubeFaceIndex(target), glImage->getCubeFaceIndex());
+-
+-    auto glTexture = reinterpret_cast<GlTexture *>(glImage->peekSharingHandler());
+-    EXPECT_EQ(glTexture->getTarget(), target);
+-
+-    EXPECT_EQ(glImage->getImageDesc().image_type, Image::convertType(imgDesc.imageType));
+-    if (target == GL_TEXTURE_BUFFER) {
+-        EXPECT_EQ(glImage->getImageDesc().image_width,
+-                  static_cast<size_t>(glTexture->getTextureInfo()->textureBufferWidth));
+-        EXPECT_EQ(glImage->getImageDesc().image_row_pitch,
+-                  static_cast<size_t>(glTexture->getTextureInfo()->textureBufferSize));
+-    } else {
+-        EXPECT_EQ(glImage->getImageDesc().image_width, gmm->gmmResourceInfo->getBaseWidth());
+-        size_t slicePitch = glImage->getHostPtrSlicePitch();
+-        size_t rowPitch = glImage->getHostPtrRowPitch();
+-        EXPECT_EQ(glImage->getImageDesc().image_row_pitch, rowPitch);
+-        EXPECT_EQ(glImage->getImageDesc().image_slice_pitch, slicePitch);
+-
+-        size_t gmmRowPitch = gmm->gmmResourceInfo->getRenderPitch();
+-        if (gmmRowPitch == 0) {
+-            size_t alignedWidth = alignUp(glImage->getImageDesc().image_width, gmm->gmmResourceInfo->getHAlign());
+-            size_t bpp = gmm->gmmResourceInfo->getBitsPerPixel() >> 3;
+-            EXPECT_EQ(glImage->getImageDesc().image_row_pitch, alignedWidth * bpp);
+-        } else {
+-            EXPECT_EQ(glImage->getImageDesc().image_row_pitch, gmmRowPitch);
+-        }
+-
+-        size_t imageInfoRowPitch = 0;
+-        retVal = clGetImageInfo(glImage, CL_IMAGE_ROW_PITCH, sizeof(size_t), &imageInfoRowPitch, NULL);
+-        ASSERT_EQ(CL_SUCCESS, retVal);
+-        ASSERT_EQ(rowPitch, imageInfoRowPitch);
+-
+-        size_t imageInfoSlicePitch = 0;
+-        slicePitch *= !(glImage->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE2D || glImage->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE1D || glImage->getImageDesc().image_type == CL_MEM_OBJECT_IMAGE1D_BUFFER);
+-
+-        retVal = clGetImageInfo(glImage, CL_IMAGE_SLICE_PITCH, sizeof(size_t), &imageInfoSlicePitch, NULL);
+-        ASSERT_EQ(CL_SUCCESS, retVal);
+-        ASSERT_EQ(slicePitch, imageInfoSlicePitch);
+-    }
+-
+-    EXPECT_EQ(glImage->getImageDesc().image_height, gmm->gmmResourceInfo->getBaseHeight());
+-    EXPECT_EQ(glImage->getImageDesc().image_array_size, gmm->gmmResourceInfo->getArraySize());
+-    if (target == GL_TEXTURE_3D) {
+-        EXPECT_EQ(glImage->getImageDesc().image_depth, gmm->gmmResourceInfo->getBaseDepth());
+-    } else {
+-        EXPECT_EQ(glImage->getImageDesc().image_depth, 0u);
+-    }
+-
+-    if (imgDesc.imageArraySize > 1 || imgDesc.imageDepth > 1) {
+-        GMM_REQ_OFFSET_INFO gmmReqInfo = {};
+-        gmmReqInfo.ArrayIndex = imgDesc.imageArraySize > 1 ? 1 : 0;
+-        gmmReqInfo.Slice = imgDesc.imageDepth > 1 ? 1 : 0;
+-        gmmReqInfo.ReqLock = 1;
+-        gmm->gmmResourceInfo->getOffset(gmmReqInfo);
+-        size_t expectedSlicePitch = gmmReqInfo.Lock.Offset;
+-        EXPECT_EQ(glImage->getImageDesc().image_slice_pitch, expectedSlicePitch);
+-    } else {
+-        EXPECT_EQ(glImage->getImageDesc().image_slice_pitch, imgInfo.size);
+-    }
+-
+-    EXPECT_EQ(glImage->getQPitch(), gmm->queryQPitch(gmm->gmmResourceInfo->getResourceType()));
+-
+-    uint32_t numSamples = static_cast<uint32_t>(gmm->gmmResourceInfo->getNumSamples());
+-    auto expectedNumSamples = getValidParam(numSamples, 0u, 1u);
+-    EXPECT_EQ(expectedNumSamples, glImage->getImageDesc().num_samples);
+-
+-    if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+-        EXPECT_NE(nullptr, glImage->getMcsAllocation());
+-        EXPECT_EQ(getValidParam(static_cast<uint32_t>(mcsGmm->gmmResourceInfo->getRenderPitch() / 128)),
+-                  glImage->getMcsSurfaceInfo().pitch);
+-        EXPECT_EQ(static_cast<uint32_t>(mcsGmm->gmmResourceInfo->getQPitch()),
+-                  glImage->getMcsSurfaceInfo().qPitch);
+-        EXPECT_EQ(GmmTypesConverter::getRenderMultisamplesCount(static_cast<uint32_t>(gmm->gmmResourceInfo->getNumSamples())),
+-                  glImage->getMcsSurfaceInfo().multisampleCount);
+-    }
+-
+-    delete glImage;
+-}
+-
+-TEST_P(CreateFromGlTextureTestsWithParams, givenArrayTextureTargetAndArraySizeEqualOneWhenCreateIsCalledThenSlicePitchAndSizeAreEqual) {
+-    unsigned int target = GetParam();
+-    // only array targets
+-    if (target == GL_TEXTURE_1D_ARRAY ||
+-        target == GL_TEXTURE_2D_ARRAY) {
+-        imgDesc.imageType = Image::convertType(GlTexture::getClMemObjectType(target));
+-        imgDesc.imageWidth = 5;
+-        if (target == GL_TEXTURE_2D_ARRAY) {
+-            imgDesc.imageHeight = 5;
+-        }
+-        imgDesc.imageArraySize = 1;
+-
+-        updateImgInfoAndForceGmm();
+-
+-        auto glImage = GlTexture::createSharedGlTexture(&clContext, (cl_mem_flags)0, target, 0, 0, &retVal);
+-
+-        EXPECT_EQ(CL_SUCCESS, retVal);
+-        EXPECT_EQ(glImage->getImageDesc().image_slice_pitch, imgInfo.size);
+-
+-        delete glImage;
+-    }
+-}
+-
+-TEST_P(CreateFromGlTextureTestsWithParams, givenZeroRowPitchFromGmmWhenCreatingTextureThenComputeIt) {
+-    unsigned int target = GL_TEXTURE_2D;
+-
+-    imgDesc.imageType = Image::convertType(GlTexture::getClMemObjectType(target));
+-    imgDesc.imageWidth = 5;
+-    imgDesc.imageHeight = 5;
+-    imgDesc.imageArraySize = 1;
+-
+-    updateImgInfoAndForceGmm();
+-
+-    auto mockResInfo = static_cast<MockGmmResourceInfo *>(gmm->gmmResourceInfo.get());
+-    mockResInfo->overrideReturnedRenderPitch(0u);
+-
+-    auto alignedWidth = alignUp(imgDesc.imageWidth, gmm->gmmResourceInfo->getHAlign());
+-    auto expectedRowPitch = alignedWidth * (gmm->gmmResourceInfo->getBitsPerPixel() >> 3);
+-
+-    auto glImage = std::unique_ptr<Image>(GlTexture::createSharedGlTexture(&clContext, (cl_mem_flags)0, target, 0, 0, &retVal));
+-
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(imgInfo.size, glImage->getImageDesc().image_slice_pitch);
+-    EXPECT_EQ(expectedRowPitch, glImage->getImageDesc().image_row_pitch);
+-}
+-
+-} // namespace NEO
+diff --git a/opencl/test/unit_test/sharings/gl/linux/gl_library_name.cpp b/opencl/test/unit_test/sharings/gl/linux/gl_library_name.cpp
+index 0c5654f7df67..e9028ef1b13b 100644
+--- a/opencl/test/unit_test/sharings/gl/linux/gl_library_name.cpp
++++ b/opencl/test/unit_test/sharings/gl/linux/gl_library_name.cpp
+@@ -1,11 +1,10 @@
+ /*
+- * Copyright (C) 2022-2023 Intel Corporation
++ * Copyright (C) 2022-2024 Intel Corporation
+  *
+  * SPDX-License-Identifier: MIT
+  *
+  */
+ 
+ namespace Os {
+-const char *eglDllName = "";
+ const char *openglDllName = "";
+ } // namespace Os
+diff --git a/opencl/test/unit_test/sharings/gl/linux/gl_texture_tests.cpp b/opencl/test/unit_test/sharings/gl/linux/gl_texture_tests.cpp
+deleted file mode 100644
+index e2b3f0c1ca8b..000000000000
+--- a/opencl/test/unit_test/sharings/gl/linux/gl_texture_tests.cpp
++++ /dev/null
+@@ -1,370 +0,0 @@
+-/*
+- * Copyright (C) 2018-2023 Intel Corporation
+- *
+- * SPDX-License-Identifier: MIT
+- *
+- */
+-
+-#include "shared/source/os_interface/product_helper.h"
+-#include "shared/test/common/libult/ult_command_stream_receiver.h"
+-#include "shared/test/common/mocks/mock_gmm.h"
+-#include "shared/test/common/mocks/mock_gmm_resource_info.h"
+-#include "shared/test/common/mocks/mock_memory_manager.h"
+-
+-#include "opencl/source/helpers/gmm_types_converter.h"
+-#include "opencl/source/mem_obj/image.h"
+-#include "opencl/source/platform/platform.h"
+-#include "opencl/source/sharings/gl/gl_texture.h"
+-#include "opencl/test/unit_test/mocks/gl/linux/mock_gl_sharing_linux.h"
+-#include "opencl/test/unit_test/mocks/mock_cl_device.h"
+-#include "opencl/test/unit_test/mocks/mock_context.h"
+-#include "opencl/test/unit_test/mocks/mock_platform.h"
+-
+-#include "gtest/gtest.h"
+-
+-using namespace NEO;
+-
+-class GlSharingTextureTests : public ::testing::Test {
+-  public:
+-    class TempMM : public MockMemoryManager {
+-      public:
+-        using MockMemoryManager::MockMemoryManager;
+-        GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+-            auto alloc = OsAgnosticMemoryManager::createGraphicsAllocationFromSharedHandle(handle, properties, requireSpecificBitness, isHostIpcAllocation, reuseSharedAllocation, mapPointer);
+-            if (useForcedGmm) {
+-                if (alloc->getDefaultGmm()) {
+-                    delete alloc->getDefaultGmm();
+-                }
+-                alloc->setDefaultGmm(forceGmm.get());
+-            }
+-            return alloc;
+-        }
+-        void freeGraphicsMemoryImpl(GraphicsAllocation *gfxAllocation) override {
+-            if (useForcedGmm) {
+-                forceGmm.release();
+-            }
+-            OsAgnosticMemoryManager::freeGraphicsMemoryImpl(gfxAllocation);
+-        }
+-        bool mapAuxGpuVA(GraphicsAllocation *graphicsAllocation) override {
+-            mapAuxGpuVACalled++;
+-            return false;
+-        }
+-        uint32_t mapAuxGpuVACalled = 0u;
+-        size_t forceAllocationSize;
+-        std::unique_ptr<Gmm> forceGmm;
+-        bool useForcedGmm = true;
+-    };
+-
+-    void SetUp() override {
+-        executionEnvironment = platform()->peekExecutionEnvironment();
+-        imgDesc = {};
+-        imgDesc.imageType = ImageType::image2D;
+-        imgDesc.imageWidth = 10;
+-        imgDesc.imageHeight = 10;
+-        auto imgInfo = MockGmm::initImgInfo(imgDesc, 0, nullptr);
+-
+-        tempMM = new TempMM(*executionEnvironment);
+-        executionEnvironment->memoryManager.reset(tempMM);
+-        device = std::make_unique<MockClDevice>(MockDevice::create<MockDevice>(executionEnvironment, 0));
+-        clContext = std::make_unique<MockContext>(device.get());
+-
+-        mockGlSharingFunctions = glSharing->sharingFunctions.release();
+-        clContext->setSharingFunctions(mockGlSharingFunctions);
+-
+-        tempMM->forceGmm = MockGmm::queryImgParams(device->getGmmHelper(), imgInfo, false);
+-        tempMM->forceAllocationSize = textureSize;
+-        textureSize = imgInfo.size;
+-        textureId = 1;
+-    }
+-
+-    void setUnifiedAuxSurf() {
+-        tempMM->useForcedGmm = true;
+-        auto mockGmmResInfo = static_cast<MockGmmResourceInfo *>(tempMM->forceGmm->gmmResourceInfo.get());
+-        mockGmmResInfo->setUnifiedAuxTranslationCapable();
+-    }
+-
+-    ExecutionEnvironment *executionEnvironment;
+-    ImageDescriptor imgDesc;
+-    TempMM *tempMM;
+-    std::unique_ptr<MockClDevice> device;
+-    std::unique_ptr<MockContext> clContext;
+-    std::unique_ptr<MockGlSharing> glSharing = std::make_unique<MockGlSharing>();
+-    GlSharingFunctionsMock *mockGlSharingFunctions;
+-    size_t textureSize;
+-    unsigned int textureId;
+-};
+-
+-TEST_F(GlSharingTextureTests, givenMockGlWhen2dGlTextureIsCreatedThenMemObjectHasGlHandler) {
+-    cl_int retVal = CL_INVALID_VALUE;
+-
+-    glSharing->uploadDataToTextureInfo(textureId);
+-
+-    auto glTexture = GlTexture::createSharedGlTexture(clContext.get(), (cl_mem_flags)0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-    ASSERT_NE(nullptr, glTexture);
+-    auto graphicsAllocation = glTexture->getGraphicsAllocation(device->getRootDeviceIndex());
+-    EXPECT_NE(nullptr, graphicsAllocation);
+-    EXPECT_EQ(textureSize, graphicsAllocation->getUnderlyingBufferSize());
+-    EXPECT_EQ(1, glSharing->dllParam->getParam("GLAcquireSharedTextureCalled"));
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-
+-    EXPECT_EQ(textureId, glSharing->dllParam->getTextureInfo().name); // input
+-
+-    auto handler = glTexture->peekSharingHandler();
+-    ASSERT_NE(nullptr, handler);
+-    auto glHandler = static_cast<GlSharing *>(handler);
+-
+-    EXPECT_EQ(glHandler->peekFunctionsHandler(), mockGlSharingFunctions);
+-
+-    delete glTexture;
+-}
+-
+-class FailingMemoryManager : public MockMemoryManager {
+-  public:
+-    GraphicsAllocation *createGraphicsAllocationFromSharedHandle(osHandle handle, const AllocationProperties &properties, bool requireSpecificBitness, bool isHostIpcAllocation, bool reuseSharedAllocation, void *mapPointer) override {
+-        return nullptr;
+-    }
+-};
+-
+-TEST_F(GlSharingTextureTests, givenMockGlWhenGlTextureIsCreatedFromWrongHandleThenErrorAndNoTextureIsReturned) {
+-    auto tempMemoryManager = clContext->getMemoryManager();
+-    tempMM->useForcedGmm = false;
+-    auto memoryManager = std::unique_ptr<FailingMemoryManager>(new FailingMemoryManager());
+-    clContext->memoryManager = memoryManager.get();
+-
+-    auto retVal = CL_SUCCESS;
+-    auto glTexture = GlTexture::createSharedGlTexture(clContext.get(), (cl_mem_flags)0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-
+-    EXPECT_EQ(nullptr, glTexture);
+-    EXPECT_EQ(CL_INVALID_GL_OBJECT, retVal);
+-
+-    clContext->memoryManager = tempMemoryManager;
+-}
+-
+-EGLBoolean mockGLAcquireSharedTexture(EGLDisplay dpy, EGLImageKHR image, int *fds, EGLint *strides, EGLint *offsets) {
+-    CL_GL_RESOURCE_INFO textureInfo;
+-    GlDllHelper dllParam;
+-    textureInfo.globalShareHandle = dllParam.getTextureInfo().globalShareHandle;
+-    textureInfo.globalShareHandleMCS = dllParam.getTextureInfo().globalShareHandleMCS;
+-    if (textureInfo.target == GL_TEXTURE_BUFFER) {
+-        // size and width for texture buffer are queried from textureInfo - not from gmm
+-        textureInfo.textureBufferSize = dllParam.getTextureInfo().textureBufferSize;
+-        textureInfo.textureBufferWidth = dllParam.getTextureInfo().textureBufferWidth;
+-    }
+-    textureInfo.pGmmResInfo = dllParam.getTextureInfo().pGmmResInfo;
+-    textureInfo.glInternalFormat = 99999;
+-    textureInfo.glHWFormat = dllParam.getTextureInfo().glHWFormat;
+-    textureInfo.textureBufferOffset = dllParam.getTextureInfo().textureBufferOffset;
+-    dllParam.loadTexture(textureInfo);
+-
+-    *fds = 0;
+-    return GL_FALSE;
+-};
+-
+-TEST_F(GlSharingTextureTests, givenMockGlWhenGlTextureIsCreatedFromIncorrectFormatThenErrorAndNoTextureIsReturned) {
+-    mockGlSharingFunctions->setGLAcquireSharedTextureMock(mockGLAcquireSharedTexture);
+-
+-    tempMM->useForcedGmm = false;
+-    auto retVal = CL_SUCCESS;
+-    auto glTexture = GlTexture::createSharedGlTexture(clContext.get(), (cl_mem_flags)0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-
+-    EXPECT_EQ(nullptr, glTexture);
+-    EXPECT_EQ(CL_INVALID_GL_OBJECT, retVal);
+-}
+-
+-TEST_F(GlSharingTextureTests, givenGmmResourceAsInputWhenTextureIsCreatedThenItHasGmmSet) {
+-    cl_int retVal = CL_INVALID_VALUE;
+-
+-    glSharing->textureInfoOutput.globalShareHandle = textureId;
+-    glSharing->textureInfoOutput.pGmmResInfo = this->tempMM->forceGmm->gmmResourceInfo->peekGmmResourceInfo();
+-    this->tempMM->useForcedGmm = false;
+-    glSharing->textureInfoOutput.pGmmResInfo = this->tempMM->forceGmm->gmmResourceInfo->peekGmmResourceInfo();
+-
+-    glSharing->uploadDataToTextureInfo();
+-
+-    auto glTexture = GlTexture::createSharedGlTexture(clContext.get(), (cl_mem_flags)0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-    ASSERT_NE(nullptr, glTexture);
+-    auto graphicsAllocation = glTexture->getGraphicsAllocation(device->getRootDeviceIndex());
+-    EXPECT_NE(nullptr, graphicsAllocation);
+-
+-    ASSERT_NE(nullptr, graphicsAllocation->getDefaultGmm());
+-    ASSERT_NE(nullptr, graphicsAllocation->getDefaultGmm()->gmmResourceInfo->peekHandle());
+-
+-    delete glTexture;
+-}
+-
+-TEST_F(GlSharingTextureTests, givenContextWithoutSharingAnd2dTextureWhenClCreateFromGlTextureIsCalledThenErrorIsReturned) {
+-    tempMM->useForcedGmm = false;
+-    clContext->resetSharingFunctions(CLGL_SHARING);
+-    cl_int retVal = CL_INVALID_GL_OBJECT;
+-    auto glImage = clCreateFromGLTexture(clContext.get(), 0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-    ASSERT_EQ(CL_INVALID_CONTEXT, retVal);
+-    ASSERT_EQ(nullptr, glImage);
+-}
+-
+-TEST_F(GlSharingTextureTests, givenGlCl2dTextureWhenAskedForCLGLGetInfoThenIdAndTypeIsReturned) {
+-    auto retVal = CL_SUCCESS;
+-    auto glImage = clCreateFromGLTexture(clContext.get(), 0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-    ASSERT_EQ(CL_SUCCESS, retVal);
+-    ASSERT_NE(nullptr, glImage);
+-
+-    cl_gl_object_type objectType = 0u;
+-    cl_GLuint objectId = 0u;
+-
+-    retVal = clGetGLObjectInfo(glImage, &objectType, &objectId);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(objectType, (cl_gl_object_type)CL_GL_OBJECT_TEXTURE2D);
+-    EXPECT_EQ(objectId, textureId);
+-
+-    retVal = clReleaseMemObject(glImage);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-}
+-
+-TEST_F(GlSharingTextureTests, givenContextWithoutSharingAndGlTextureWhenItIsCreatedWithClCreateFromGlTexture1dThenErrorIsReturned) {
+-    tempMM->useForcedGmm = false;
+-    clContext->resetSharingFunctions(CLGL_SHARING);
+-    auto retVal = CL_SUCCESS;
+-    auto glImage = clCreateFromGLTexture2D(clContext.get(), 0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-    ASSERT_EQ(CL_INVALID_CONTEXT, retVal);
+-    ASSERT_EQ(nullptr, glImage);
+-}
+-
+-TEST_F(GlSharingTextureTests, givenHwCommandQueueAndGlTextureWhenItIsCreatedWithClCreateFromGlTexture2dThenImageObjectIsReturned) {
+-    auto retVal = CL_SUCCESS;
+-    auto glImage = clCreateFromGLTexture2D(clContext.get(), 0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-    ASSERT_EQ(CL_SUCCESS, retVal);
+-    ASSERT_NE(nullptr, glImage);
+-
+-    cl_gl_object_type objectType = 0u;
+-    cl_GLuint objectId = 0u;
+-
+-    retVal = clGetGLObjectInfo(glImage, &objectType, &objectId);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(objectType, (cl_gl_object_type)CL_GL_OBJECT_TEXTURE2D);
+-    EXPECT_EQ(objectId, textureId);
+-
+-    retVal = clReleaseMemObject(glImage);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-}
+-
+-TEST_F(GlSharingTextureTests, givenHwCommandQueueAndGlTextureWhenAcquireIsCalledThenAcquireCountIsIncremented) {
+-    glSharing->uploadDataToTextureInfo(textureId);
+-
+-    auto retVal = CL_SUCCESS;
+-    auto commandQueue = clCreateCommandQueue(clContext.get(), clContext->getDevice(0), 0, &retVal);
+-    ASSERT_EQ(CL_SUCCESS, retVal);
+-
+-    auto glImage = clCreateFromGLTexture(clContext.get(), 0, GL_TEXTURE_2D, 0, textureId, &retVal);
+-
+-    EXPECT_EQ(1, glSharing->dllParam->getParam("GLAcquireSharedTextureCalled"));
+-    retVal = clEnqueueAcquireGLObjects(commandQueue, 1, &glImage, 0, nullptr, nullptr);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(2, glSharing->dllParam->getParam("GLAcquireSharedTextureCalled"));
+-
+-    retVal = clEnqueueReleaseGLObjects(commandQueue, 1, &glImage, 0, nullptr, nullptr);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-
+-    retVal = clEnqueueAcquireGLObjects(commandQueue, 1, &glImage, 0, nullptr, nullptr);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(3, glSharing->dllParam->getParam("GLAcquireSharedTextureCalled"));
+-
+-    retVal = clReleaseCommandQueue(commandQueue);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    retVal = clReleaseMemObject(glImage);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-}
+-
+-class GetGlTextureInfoTests : public GlSharingTextureTests,
+-                              public ::testing::WithParamInterface<unsigned int /*cl_GLenum*/> {
+-};
+-
+-INSTANTIATE_TEST_CASE_P(
+-    GetGlTextureInfoTests,
+-    GetGlTextureInfoTests,
+-    testing::ValuesIn(glTextureTargets::supportedTargets));
+-
+-TEST_P(GetGlTextureInfoTests, givenGlTextureWhenAskedForCLGetGLTextureInfoThenReturnValidInfo) {
+-    auto retVal = CL_SUCCESS;
+-    GLenum expectedTarget = GetParam();
+-    GLint mipLevel = 1u;
+-    auto glImage = clCreateFromGLTexture(clContext.get(), 0, expectedTarget, mipLevel, textureId, &retVal);
+-    ASSERT_EQ(CL_SUCCESS, retVal);
+-    ASSERT_NE(nullptr, glImage);
+-
+-    auto pMemObj = castToObject<MemObj>(glImage);
+-    auto glTextureObj = (GlTexture *)pMemObj->peekSharingHandler();
+-
+-    GLenum textureTarget = 0u;
+-
+-    size_t retSize = 0;
+-
+-    retVal = clGetGLTextureInfo(glImage, CL_GL_TEXTURE_TARGET, sizeof(GLenum), &textureTarget, &retSize);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(expectedTarget, textureTarget);
+-    EXPECT_EQ(sizeof(GLenum), retSize);
+-
+-    retVal = clGetGLTextureInfo(glImage, CL_GL_MIPMAP_LEVEL, sizeof(GLenum), &mipLevel, &retSize);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-    EXPECT_EQ(glTextureObj->getMiplevel(), mipLevel);
+-    EXPECT_EQ(sizeof(GLint), retSize);
+-
+-    retVal = clGetGLTextureInfo(glImage, CL_INVALID_VALUE, 0, nullptr, nullptr);
+-    EXPECT_EQ(CL_INVALID_VALUE, retVal);
+-
+-    auto image = castToObject<Image>(glImage);
+-    EXPECT_EQ(mipLevel, image->peekBaseMipLevel());
+-
+-    retVal = clReleaseMemObject(glImage);
+-    EXPECT_EQ(CL_SUCCESS, retVal);
+-}
+-
+-TEST_P(GetGlTextureInfoTests, givenApiTargetTypeWhenAskedForBaseTypeThenConvertOnlyCubeMaps) {
+-    tempMM->useForcedGmm = false;
+-    auto apiTarget = GetParam();
+-    unsigned int expectedBaseType;
+-
+-    switch (apiTarget) {
+-    case GL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+-    case GL_TEXTURE_CUBE_MAP_POSITIVE_X:
+-    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+-    case GL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+-    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+-    case GL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+-        expectedBaseType = GL_TEXTURE_CUBE_MAP_ARB;
+-        break;
+-    default:
+-        expectedBaseType = apiTarget;
+-        break;
+-    }
+-
+-    EXPECT_EQ(GlTexture::getBaseTargetType(apiTarget), expectedBaseType);
+-}
+-
+-TEST_P(GetGlTextureInfoTests, givenApiTargetTypeWhenAskedForGmmCubeFaceIndexThenReturnValidOnlyForCubeType) {
+-    tempMM->useForcedGmm = false;
+-    auto apiTarget = GetParam();
+-    auto gmmCubeFaceIndex = static_cast<unsigned int>(GmmTypesConverter::getCubeFaceIndex(apiTarget));
+-
+-    switch (apiTarget) {
+-    case GL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_CUBE_FACE_NEG_X));
+-        break;
+-    case GL_TEXTURE_CUBE_MAP_POSITIVE_X:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_CUBE_FACE_POS_X));
+-        break;
+-    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_CUBE_FACE_NEG_Y));
+-        break;
+-    case GL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_CUBE_FACE_POS_Y));
+-        break;
+-    case GL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_CUBE_FACE_NEG_Z));
+-        break;
+-    case GL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_CUBE_FACE_POS_Z));
+-        break;
+-    default:
+-        EXPECT_EQ(gmmCubeFaceIndex, static_cast<unsigned int>(__GMM_NO_CUBE_MAP));
+-        break;
+-    }
+-}
+diff --git a/third_party/opengl_headers/GL/mesa_glinterop.h b/third_party/opengl_headers/GL/mesa_glinterop.h
+new file mode 100644
+index 000000000000..0d5a68b26964
+--- /dev/null
++++ b/third_party/opengl_headers/GL/mesa_glinterop.h
+@@ -0,0 +1,400 @@
++/*
++ * Mesa 3-D graphics library
++ *
++ * Copyright 2016 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included
++ * in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++/* Mesa OpenGL inter-driver interoperability interface designed for but not
++ * limited to OpenCL.
++ *
++ * This is a driver-agnostic, backward-compatible interface. The structures
++ * are only allowed to grow. They can never shrink and their members can
++ * never be removed, renamed, or redefined.
++ *
++ * The interface doesn't return a lot of static texture parameters like
++ * width, height, etc. It mainly returns mutable buffer and texture view
++ * parameters that can't be part of the texture allocation (because they are
++ * mutable). If drivers want to return more data or want to return static
++ * allocation parameters, they can do it in one of these two ways:
++ * - attaching the data to the DMABUF handle in a driver-specific way
++ * - passing the data via "out_driver_data" in the "in" structure.
++ *
++ * Mesa is expected to do a lot of error checking on behalf of OpenCL, such
++ * as checking the target, miplevel, and texture completeness.
++ *
++ * OpenCL, on the other hand, needs to check if the display+context combo
++ * is compatible with the OpenCL driver by querying the device information.
++ * It also needs to check if the texture internal format and channel ordering
++ * (returned in a driver-specific way) is supported by OpenCL, among other
++ * things.
++ */
++
++#ifndef MESA_GLINTEROP_H
++#define MESA_GLINTEROP_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Forward declarations to avoid inclusion of GL/glx.h */
++#ifndef GLX_H
++struct _XDisplay;
++struct __GLXcontextRec;
++#endif
++
++/* Forward declarations to avoid inclusion of EGL/egl.h */
++#ifndef __egl_h_
++typedef void *EGLDisplay;
++typedef void *EGLContext;
++#endif
++
++typedef struct __GLsync *GLsync;
++
++/** Returned error codes. */
++enum {
++   MESA_GLINTEROP_SUCCESS = 0,
++   MESA_GLINTEROP_OUT_OF_RESOURCES,
++   MESA_GLINTEROP_OUT_OF_HOST_MEMORY,
++   MESA_GLINTEROP_INVALID_OPERATION,
++   MESA_GLINTEROP_INVALID_VERSION,
++   MESA_GLINTEROP_INVALID_DISPLAY,
++   MESA_GLINTEROP_INVALID_CONTEXT,
++   MESA_GLINTEROP_INVALID_TARGET,
++   MESA_GLINTEROP_INVALID_OBJECT,
++   MESA_GLINTEROP_INVALID_MIP_LEVEL,
++   MESA_GLINTEROP_UNSUPPORTED
++};
++
++/** Access flags. */
++enum {
++   MESA_GLINTEROP_ACCESS_READ_WRITE = 0,
++   MESA_GLINTEROP_ACCESS_READ_ONLY,
++   MESA_GLINTEROP_ACCESS_WRITE_ONLY
++};
++
++#define MESA_GLINTEROP_DEVICE_INFO_VERSION 3
++
++#define UUID_SIZE 16
++
++/**
++ * Device information returned by Mesa.
++ */
++struct mesa_glinterop_device_info {
++   /* The caller should set this to the version of the struct they support */
++   /* The callee will overwrite it if it supports a lower version.
++    *
++    * The caller should check the value and access up-to the version supported
++    * by the callee.
++    */
++   /* NOTE: Do not use the MESA_GLINTEROP_DEVICE_INFO_VERSION macro */
++   uint32_t version;
++
++   /* PCI location */
++   uint32_t pci_segment_group;
++   uint32_t pci_bus;
++   uint32_t pci_device;
++   uint32_t pci_function;
++
++   /* Device identification */
++   uint32_t vendor_id;
++   uint32_t device_id;
++
++   /* Structure version 1 ends here. */
++
++   /* Size of memory pointed to by out_driver_data. */
++   uint32_t driver_data_size;
++
++   /* If the caller wants to query driver-specific data about the OpenGL
++   * object, this should point to the memory where that data will be stored.
++   * This is expected to be a temporary staging memory. The pointer is not
++   * allowed to be saved for later use by Mesa.
++   */
++   void *driver_data;
++
++   /* Structure version 2 ends here. */
++
++   char device_uuid[UUID_SIZE];
++
++   /* Structure version 3 ends here. */
++};
++
++#define MESA_GLINTEROP_EXPORT_IN_VERSION 2
++
++/**
++ * Input parameters to Mesa interop export functions.
++ */
++struct mesa_glinterop_export_in {
++   /* The caller should set this to the version of the struct they support */
++   /* The callee will overwrite it if it supports a lower version.
++    *
++    * The caller should check the value and access up-to the version supported
++    * by the callee.
++    */
++   /* NOTE: Do not use the MESA_GLINTEROP_EXPORT_IN_VERSION macro */
++   uint32_t version;
++
++   /* One of the following:
++    * - GL_TEXTURE_BUFFER
++    * - GL_TEXTURE_1D
++    * - GL_TEXTURE_2D
++    * - GL_TEXTURE_3D
++    * - GL_TEXTURE_RECTANGLE
++    * - GL_TEXTURE_1D_ARRAY
++    * - GL_TEXTURE_2D_ARRAY
++    * - GL_TEXTURE_CUBE_MAP_ARRAY
++    * - GL_TEXTURE_CUBE_MAP
++    * - GL_TEXTURE_CUBE_MAP_POSITIVE_X
++    * - GL_TEXTURE_CUBE_MAP_NEGATIVE_X
++    * - GL_TEXTURE_CUBE_MAP_POSITIVE_Y
++    * - GL_TEXTURE_CUBE_MAP_NEGATIVE_Y
++    * - GL_TEXTURE_CUBE_MAP_POSITIVE_Z
++    * - GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
++    * - GL_TEXTURE_2D_MULTISAMPLE
++    * - GL_TEXTURE_2D_MULTISAMPLE_ARRAY
++    * - GL_TEXTURE_EXTERNAL_OES
++    * - GL_RENDERBUFFER
++    * - GL_ARRAY_BUFFER
++    */
++   unsigned target;
++
++   /* If target is GL_ARRAY_BUFFER, it's a buffer object.
++    * If target is GL_RENDERBUFFER, it's a renderbuffer object.
++    * If target is GL_TEXTURE_*, it's a texture object.
++    */
++   unsigned obj;
++
++   /* Mipmap level. Ignored for non-texture objects. */
++   unsigned miplevel;
++
++   /* One of MESA_GLINTEROP_ACCESS_* flags. This describes how the exported
++    * object is going to be used.
++    */
++   uint32_t access;
++
++   /* Size of memory pointed to by out_driver_data. */
++   uint32_t out_driver_data_size;
++
++   /* If the caller wants to query driver-specific data about the OpenGL
++    * object, this should point to the memory where that data will be stored.
++    * This is expected to be a temporary staging memory. The pointer is not
++    * allowed to be saved for later use by Mesa.
++    */
++   void *out_driver_data;
++   /* Structure version 1 ends here. */
++
++   /* Structure version 2 starts here. */
++   /* NOTE: Version 2 doesn't add any fields to input but redefines the
++    *       argument to flush call to `struct mesa_glinterop_flush_out *`
++    *       instead of `GLsync *`  */
++   /* Structure version 2 ends here. */
++};
++
++#define MESA_GLINTEROP_EXPORT_OUT_VERSION 2
++
++/**
++ * Outputs of Mesa interop export functions.
++ */
++struct mesa_glinterop_export_out {
++   /* The caller should set this to the version of the struct they support */
++   /* The callee will overwrite it if it supports a lower version.
++    *
++    * The caller should check the value and access up-to the version supported
++    * by the callee.
++    */
++   /* NOTE: Do not use the MESA_GLINTEROP_EXPORT_OUT_VERSION macro */
++   uint32_t version;
++
++   /* The DMABUF handle. It must be closed by the caller using the POSIX
++    * close() function when it's not needed anymore. Mesa is not responsible
++    * for closing the handle.
++    *
++    * Not closing the handle by the caller will lead to a resource leak,
++    * will prevent releasing the GPU buffer, and may prevent creating new
++    * DMABUF handles within the process.
++    */
++   int dmabuf_fd;
++
++   /* The mutable OpenGL internal format specified by glTextureView or
++    * glTexBuffer. If the object is not one of those, the original internal
++    * format specified by glTexStorage, glTexImage, or glRenderbufferStorage
++    * will be returned.
++    */
++   unsigned internal_format;
++
++   /* Buffer offset and size for GL_ARRAY_BUFFER and GL_TEXTURE_BUFFER.
++    * This allows interop with suballocations (a buffer allocated within
++    * a larger buffer).
++    *
++    * Parameters specified by glTexBufferRange for GL_TEXTURE_BUFFER are
++    * applied to these and can shrink the range further.
++    */
++   ptrdiff_t buf_offset;
++   ptrdiff_t buf_size;
++
++   /* Parameters specified by glTextureView. If the object is not a texture
++    * view, default parameters covering the whole texture will be returned.
++    */
++   unsigned view_minlevel;
++   unsigned view_numlevels;
++   unsigned view_minlayer;
++   unsigned view_numlayers;
++
++   /* The number of bytes written to out_driver_data. */
++   uint32_t out_driver_data_written;
++   /* Structure version 1 ends here. */
++
++   /* Structure version 2 starts here. */
++   /* Texture sizes. If the object is not a texture, default parameters will
++    * be returned.
++    */
++   uint32_t width;
++   uint32_t height;
++   uint32_t depth;
++   uint32_t stride;
++   /* the modifier to use when reimporting the fd */
++   uint64_t modifier;
++   /* Structure version 2 ends here. */
++};
++
++#define MESA_GLINTEROP_FLUSH_OUT_VERSION 1
++
++/**
++ * Outputs of Mesa interop flush functions.
++ */
++struct mesa_glinterop_flush_out {
++   /* The caller should set this to the version of the struct they support */
++   /* The callee will overwrite it if it supports a lower version.
++    *
++    * The caller should check the value and access up-to the version supported
++    * by the callee.
++    */
++   /* NOTE: Do not use the MESA_GLINTEROP_EXPORT_OUT_VERSION macro */
++   uint32_t version;
++
++   /* GLsync to map to CL event, caller set it non-NULL to be filled */
++   GLsync *sync;
++
++   /* fence_fd to use in CL, caller set it to non-NULL to be filled */
++   int *fence_fd;
++};
++
++
++/**
++ * Query device information.
++ *
++ * \param dpy        GLX display
++ * \param context    GLX context
++ * \param out        where to return the information
++ *
++ * \return MESA_GLINTEROP_SUCCESS or MESA_GLINTEROP_* != 0 on error
++ */
++int
++MesaGLInteropGLXQueryDeviceInfo(struct _XDisplay *dpy, struct __GLXcontextRec *context,
++                                struct mesa_glinterop_device_info *out);
++
++
++/**
++ * Same as MesaGLInteropGLXQueryDeviceInfo except that it accepts EGLDisplay
++ * and EGLContext.
++ */
++int
++MesaGLInteropEGLQueryDeviceInfo(EGLDisplay dpy, EGLContext context,
++                                struct mesa_glinterop_device_info *out);
++
++
++/**
++ * Create and return a DMABUF handle corresponding to the given OpenGL
++ * object, and return other parameters about the OpenGL object.
++ *
++ * \param dpy        GLX display
++ * \param context    GLX context
++ * \param in         input parameters
++ * \param out        return values
++ *
++ * \return MESA_GLINTEROP_SUCCESS or MESA_GLINTEROP_* != 0 on error
++ */
++int
++MesaGLInteropGLXExportObject(struct _XDisplay *dpy, struct __GLXcontextRec *context,
++                             struct mesa_glinterop_export_in *in,
++                             struct mesa_glinterop_export_out *out);
++
++
++/**
++ * Same as MesaGLInteropGLXExportObject except that it accepts
++ * EGLDisplay and EGLContext.
++ */
++int
++MesaGLInteropEGLExportObject(EGLDisplay dpy, EGLContext context,
++                             struct mesa_glinterop_export_in *in,
++                             struct mesa_glinterop_export_out *out);
++
++
++/**
++ * Prepare OpenGL resources for being accessed by OpenCL.
++ *
++ * \param dpy        GLX display
++ * \param context    GLX context
++ * \param count      number of resources
++ * \param resources  resources to flush
++ * \param out        return values
++ *
++ * \return MESA_GLINTEROP_SUCCESS or MESA_GLINTEROP_* != 0 on error
++ */
++int
++MesaGLInteropGLXFlushObjects(struct _XDisplay *dpy, struct __GLXcontextRec *context,
++                             unsigned count, struct mesa_glinterop_export_in *resources,
++                             struct mesa_glinterop_flush_out *out);
++
++/**
++* Same as MesaGLInteropGLXFlushObjects except that it accepts
++* EGLDisplay and EGLContext.
++*/
++int
++MesaGLInteropEGLFlushObjects(EGLDisplay dpy, EGLContext context,
++                             unsigned count, struct mesa_glinterop_export_in *resources,
++                             struct mesa_glinterop_flush_out *out);
++
++
++typedef int (*PFNMESAGLINTEROPGLXQUERYDEVICEINFOPROC)(struct _XDisplay *dpy, struct __GLXcontextRec *context,
++                                                      struct mesa_glinterop_device_info *out);
++typedef int (*PFNMESAGLINTEROPEGLQUERYDEVICEINFOPROC)(EGLDisplay dpy, EGLContext context,
++                                                      struct mesa_glinterop_device_info *out);
++typedef int (*PFNMESAGLINTEROPGLXEXPORTOBJECTPROC)(struct _XDisplay *dpy, struct __GLXcontextRec *context,
++                                                   struct mesa_glinterop_export_in *in,
++                                                   struct mesa_glinterop_export_out *out);
++typedef int (*PFNMESAGLINTEROPEGLEXPORTOBJECTPROC)(EGLDisplay dpy, EGLContext context,
++                                                   struct mesa_glinterop_export_in *in,
++                                                   struct mesa_glinterop_export_out *out);
++typedef int (*PFNMESAGLINTEROPGLXFLUSHOBJECTSPROC)(struct _XDisplay *dpy, struct __GLXcontextRec *context,
++                                                   unsigned count, struct mesa_glinterop_export_in *resources,
++                                                   struct mesa_glinterop_flush_out *out);
++typedef int (*PFNMESAGLINTEROPEGLFLUSHOBJECTSPROC)(EGLDisplay dpy, EGLContext context,
++                                                   unsigned count, struct mesa_glinterop_export_in *resources,
++                                                   struct mesa_glinterop_flush_out *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* MESA_GLINTEROP_H */

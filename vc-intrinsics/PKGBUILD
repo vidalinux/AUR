@@ -1,0 +1,38 @@
+# Maintainer: Bruno Pagani <archange@archlinux.org>
+# Maintainer: Daniel Bermond <dbermond@archlinux.org>
+
+pkgname=vc-intrinsics
+pkgver=0.18.0
+_llvmmaj=15
+_llvmver="${_llvmmaj}.0.7"
+_commit=f9c34404d0ea9abad83875a10bd48d88cea90ebd  # refs/tags/v0.18.0
+pkgrel=2
+pkgdesc="Set of new intrinsics on top of core LLVM IR instructions that represent SIMD semantics of a program targeting GPU"
+arch=(x86_64)
+url="https://github.com/intel/vc-intrinsics"
+license=(MIT)
+makedepends=(cmake python llvm15 git)
+source=(git+${url}.git#commit=$_commit)
+sha256sums=('SKIP')
+
+pkgver() {
+  cd ${pkgname}
+  git describe --tags | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./;s/-/+/'
+}
+
+build() {
+  export CXXFLAGS+=" -ffat-lto-objects"
+  cmake -B build -S ${pkgname} \
+    -G 'Unix Makefiles' \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/lib/llvm15 \
+    -DLLVM_DIR=/usr/lib/llvm${_llvmmaj}/lib/cmake/llvm/ \
+    -DPREFERRED_LLVM_VERSION="$_llvmver" \
+    -Wno-dev
+  cmake --build build
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install build
+  install -vDm 644 $pkgname/LICENSE.md -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

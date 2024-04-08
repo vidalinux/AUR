@@ -1,0 +1,44 @@
+# Maintainer: Daurnimator <daurnimator@archlinux.org>
+# Maintainer: Laurent Carlier <lordheavym@gmail.com>
+
+pkgname=spirv-tools
+pkgver=2024.1
+# There was no release tag, just the release candidate
+_tag="${pkgver}.rc1"
+pkgrel=1
+pkgdesc="API and commands for processing SPIR-V modules"
+arch=('x86_64')
+url="https://www.khronos.org/vulkan/"
+license=('Apache-2.0')
+groups=(vulkan-devel)
+depends=('gcc-libs' 'sh')
+makedepends=('cmake' 'python' 'ninja' 'spirv-headers=1:1.3.280.0')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/v${_tag}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "SPIRV-Tools-${_tag}"
+
+  cmake \
+      -Bbuild \
+      -GNinja \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DCMAKE_BUILD_TYPE=None \
+      -DSPIRV_WERROR=Off \
+      -DBUILD_SHARED_LIBS=ON \
+      -DSPIRV_TOOLS_BUILD_STATIC=OFF \
+      -DSPIRV-Headers_SOURCE_DIR=/usr
+  cmake --build build
+}
+
+check() {
+  cd "SPIRV-Tools-${_tag}"
+  ninja -C build test
+}
+
+package() {
+  cd "SPIRV-Tools-${_tag}"
+
+  DESTDIR="${pkgdir}" cmake --install build
+}
