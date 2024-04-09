@@ -1,5 +1,7 @@
 # Maintainer: Daniel Bermond <dbermond@archlinux.org>
 
+_commit=bc1d13ecc1c6f7aa5da3acf33165037d3fc5ed06
+_shortcommit=$(c=${commit}; echo ${c:0:7})
 _srcname=opencl-clang
 pkgname=intel-opencl-clang
 pkgver=15.0.0
@@ -8,15 +10,14 @@ _llvmver="${_llvmmaj}.0.7"
 pkgrel=1
 pkgdesc='Wrapper library around clang that can compile OpenCL C kernels to SPIR-V modules (git version)'
 arch=('x86_64')
-url='https://github.com/intel/opencl-clang/'
+url='https://github.com/intel/opencl-clang'
 license=('custom')
 depends=('clang15' 'llvm15-libs' 'lld15')
 makedepends=('git' 'cmake' 'llvm15' 'spirv-llvm15-translator=15.0.0')
 provides=('intel-opencl-clang' 'opencl-clang-git')
 conflicts=('intel-opencl-clang' 'opencl-clang-git')
 replaces=('opencl-clang-git')
-#source=("https://github.com/intel/opencl-clang/archive/refs/tags/v${pkgver}.tar.gz"
-source=("https://github.com/intel/opencl-clang/archive/refs/tags/opencl-clang-bc1d13e.tar.gz"
+source=("${url}/archive/${commit}/${name}-${shortcommit}.tar.gz"
         "415.patch")
 
 sha256sums=('SKIP'
