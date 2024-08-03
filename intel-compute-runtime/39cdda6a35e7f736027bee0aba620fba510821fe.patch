@@ -1,0 +1,129 @@
+From 39cdda6a35e7f736027bee0aba620fba510821fe Mon Sep 17 00:00:00 2001
+From: Sylvain Munaut <tnt@246tNt.com>
+Date: Fri, 21 Jun 2024 13:18:09 +0200
+Subject: [PATCH] fix: In linux CL/GL sharing, use modifier to select tiling
+ mode
+
+Previously we just assumed that whatever tiling mode was picked by mesa
+will match the one picked by GMMLIB but that's not always the case
+and in particular on Arc and Xe it doesn't work ... Mesa picks Tile4
+and GMMLIB picks Tile64 ...
+
+Fixes: https://github.com/intel/compute-runtime/issues/736
+
+Signed-off-by: Sylvain Munaut <tnt@246tNt.com>
+---
+ .../sharings/gl/linux/gl_texture_linux.cpp    | 24 ++++++++++++++++-
+ shared/source/gmm_helper/gmm.cpp              | 26 +++++++++++++++++++
+ shared/source/helpers/surface_format_info.h   | 12 +++++++++
+ 3 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/opencl/source/sharings/gl/linux/gl_texture_linux.cpp b/opencl/source/sharings/gl/linux/gl_texture_linux.cpp
+index 6cdc0b0d06384..581887c5d0967 100644
+--- a/opencl/source/sharings/gl/linux/gl_texture_linux.cpp
++++ b/opencl/source/sharings/gl/linux/gl_texture_linux.cpp
+@@ -29,6 +29,8 @@
+ #include "config.h"
+ #include <GL/gl.h>
+ 
++#include "third_party/uapi/drm/drm_fourcc.h"
++
+ namespace NEO {
+ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl_GLenum target, cl_GLint miplevel, cl_GLuint texture,
+                                         cl_int *errcodeRet) {
+@@ -135,7 +137,27 @@ Image *GlTexture::createSharedGlTexture(Context *context, cl_mem_flags flags, cl
+     imgInfo.imgDesc.imageHeight = imgDesc.image_height;
+     imgInfo.imgDesc.imageDepth = imgDesc.image_depth;
+     imgInfo.imgDesc.imageRowPitch = imgDesc.image_row_pitch;
+-    imgInfo.linearStorage = (texOut.modifier == 0);
++
++    switch (texOut.modifier) {
++    case DRM_FORMAT_MOD_LINEAR:
++        imgInfo.linearStorage = true;
++        break;
++    case I915_FORMAT_MOD_X_TILED:
++        imgInfo.forceTiling = ImageTilingMode::tiledX;
++        break;
++    case I915_FORMAT_MOD_Y_TILED:
++        imgInfo.forceTiling = ImageTilingMode::tiledY;
++        break;
++    case I915_FORMAT_MOD_Yf_TILED:
++        imgInfo.forceTiling = ImageTilingMode::tiledYf;
++        break;
++    case I915_FORMAT_MOD_4_TILED:
++        imgInfo.forceTiling = ImageTilingMode::tiled4;
++        break;
++    default:
++       /* Just pray mesa picked the same that compute-runtime will */
++       break;
++    }
+ 
+     errorCode.set(CL_SUCCESS);
+ 
+diff --git a/shared/source/gmm_helper/gmm.cpp b/shared/source/gmm_helper/gmm.cpp
+index f33c4944d8375..0fbd6145849aa 100644
+--- a/shared/source/gmm_helper/gmm.cpp
++++ b/shared/source/gmm_helper/gmm.cpp
+@@ -130,6 +130,32 @@ void Gmm::setupImageResourceParams(ImageInfo &imgInfo, bool preferCompressed) {
+ 
+     resourceParams.Flags.Info.Linear = imgInfo.linearStorage;
+ 
++    switch (imgInfo.forceTiling) {
++    case ImageTilingMode::tiledW:
++        resourceParams.Flags.Info.TiledW = true;
++        break;
++    case ImageTilingMode::tiledX:
++        resourceParams.Flags.Info.TiledX = true;
++        break;
++    case ImageTilingMode::tiledY:
++        resourceParams.Flags.Info.TiledY = true;
++        break;
++    case ImageTilingMode::tiledYf:
++        resourceParams.Flags.Info.TiledYf = true;
++        break;
++    case ImageTilingMode::tiledYs:
++        resourceParams.Flags.Info.TiledYs = true;
++        break;
++    case ImageTilingMode::tiled4:
++        resourceParams.Flags.Info.Tile4 = true;
++        break;
++    case ImageTilingMode::tiled64:
++        resourceParams.Flags.Info.Tile64 = true;
++        break;
++    default:
++        break;
++    }
++
+     auto &gfxCoreHelper = gmmHelper->getRootDeviceEnvironment().getHelper<GfxCoreHelper>();
+     auto &productHelper = gmmHelper->getRootDeviceEnvironment().getHelper<ProductHelper>();
+     resourceParams.NoGfxMemory = 1; // dont allocate, only query for params
+diff --git a/shared/source/helpers/surface_format_info.h b/shared/source/helpers/surface_format_info.h
+index dfd1fcb771643..d40141e73015e 100644
+--- a/shared/source/helpers/surface_format_info.h
++++ b/shared/source/helpers/surface_format_info.h
+@@ -230,6 +230,17 @@ struct ImageDescriptor {
+     bool fromParent;
+ };
+ 
++enum class ImageTilingMode {
++    tiledAuto = 0,
++    tiledW,
++    tiledX,
++    tiledY,
++    tiledYf,
++    tiledYs,
++    tiled4,
++    tiled64,
++};
++
+ struct ImageInfo {
+     ImageDescriptor imgDesc;
+     const SurfaceFormatInfo *surfaceFormat;
+@@ -246,6 +257,7 @@ struct ImageInfo {
+     uint32_t mipCount;
+     bool linearStorage;
+     bool useLocalMemory;
++    ImageTilingMode forceTiling;
+ };
+ 
+ struct ImageImplicitArgs {
